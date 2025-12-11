@@ -201,7 +201,7 @@ This document identifies missing UDS services and SOVD endpoints that need to be
 
 ### Current Status
 - **Supported**: Only DoIP (Diagnostics over IP - Ethernet-based, ISO 13400)
-- **Missing**: CAN, LIN, K-line, and other legacy transport protocols
+- **Missing**: CAN, LIN, K-line, J2534 PassThru, and other legacy transport protocols
 - **Priority**: **HIGH** - Critical for supporting legacy vehicles and ECUs
 
 ### Evidence in Codebase
@@ -258,6 +258,170 @@ This document identifies missing UDS services and SOVD endpoints that need to be
   - Implement `EcuGateway` trait for K-line
   - Hardware abstraction for K-line interfaces
 
+#### 4. J2534 PassThru API - SAE J2534
+- **Status**: ❌ Not implemented
+- **Standard**: SAE J2534-1, SAE J2534-2
+- **Priority**: **HIGH** - Industry-standard API for aftermarket diagnostic tools
+- **Why It Matters**:
+  - **Multi-Protocol Support**: Single API supports CAN, ISO15765, ISO14230, ISO9141, J1850, and more
+  - **Standardized Interface**: SAE standard ensures compatibility across vendors
+  - **No Hardware Lock-in**: Users can choose their preferred PassThru device
+  - **Cost-Effective**: Leverages existing commercial hardware investments
+
+**Implementation Requirements**:
+
+**A. Core J2534 Gateway (`cda-comm-j2534` crate)**:
+```
+cda-comm-j2534/
+├── Cargo.toml
+└── src/
+    ├── lib.rs                  # J2534DiagGateway implementing EcuGateway trait
+    ├── connections.rs          # Connection pool and device management
+    ├── device_connection.rs    # PassThru device connection handling
+    ├── channel_manager.rs      # J2534 channel lifecycle management
+    └── protocol_translator.rs  # UDS-to-J2534 protocol mapping
+```
+
+**B. Architecture Components**:
+
+1. **J2534DiagGateway Structure** (similar to `DoipDiagGateway`):
+   - Implements `EcuGateway` trait from `cda-interfaces`
+   - Manages multiple J2534 devices (connection pool)
+   - Maps ECU logical addresses to J2534 channels
+   - Handles asynchronous read/write operations
+   - Manages tester present via periodic messaging
+
+2. **J2534Device Connection Manager**:
+   - Device enumeration (PassThruOpen)
+   - Channel management (PassThruConnect/PassThruDisconnect)
+   - Filter configuration (PassThruStartMsgFilter)
+   - Message queuing (async TX/RX queues)
+   - Error handling and retry logic
+
+3. **Protocol Translators**:
+   - ISO15765 (CAN/ISO-TP) translator
+   - ISO14230 (KWP2000) translator
+   - ISO9141 (K-Line) translator
+   - J1850 VPW/PWM translators
+   - Protocol-specific frame assembly/disassembly
+
+4. **FFI Bindings**:
+   - Use existing Rust J2534 crate (e.g., `j2534` or `j2534-rs`)
+   - OR create custom FFI bindings to J2534 DLLs
+   - Dynamic library loading (libloading)
+
+**C. Interface Extensions** (`cda-interfaces/src/com_param_handling.rs`):
+
+Add new trait `J2534ComParamProvider`:
+```rust
+pub trait J2534ComParamProvider: Send + Sync + 'static {
+    fn device_name(&self) -> String;              // PassThru device name
+    fn protocol(&self) -> J2534Protocol;          // CAN, ISO15765, ISO14230, etc.
+    fn baudrate(&self) -> u32;                    // Bus baudrate
+    fn connection_flags(&self) -> u32;            // Protocol-specific flags
+    fn filters(&self) -> Vec<FilterConfig>;       // Message filters
+    fn timeout_read(&self) -> Duration;           // Read timeout
+    fn timeout_write(&self) -> Duration;          // Write timeout
+    fn can_extended_addressing(&self) -> bool;    // Extended vs standard addressing
+    fn can_id_tx(&self) -> Option<u32>;          // CAN TX ID (if applicable)
+    fn can_id_rx(&self) -> Option<u32>;          // CAN RX ID (if applicable)
+}
+
+pub enum J2534Protocol {
+    J1850VPW,
+    J1850PWM,
+    ISO9141,
+    ISO14230,     // KWP2000
+    CAN,
+    ISO15765,     // CAN with ISO-TP
+    // Additional protocols...
+}
+```
+
+**D. Configuration Extension** (`opensovd-cda.toml`):
+```toml
+[communication]
+# Existing
+doip_enabled = true
+tester_address = "192.168.1.100"
+
+# NEW J2534 Configuration
+j2534_enabled = true
+j2534_device = "PassThruDevice.04.04"  # Device name from Windows registry
+j2534_protocol = "ISO15765"            # Default protocol
+j2534_can_baudrate = 500000
+
+```
+
+**E. MDD Database Extensions** (`cda-database`):
+
+Extend MDD parser to support J2534 communication parameters:
+```rust
+pub struct J2534ComParams {
+    pub device_name: String,
+    pub protocol: J2534Protocol,
+    pub baudrate: u32,
+    pub can_id_tx: Option<u32>,       // CAN TX identifier
+    pub can_id_rx: Option<u32>,       // CAN RX identifier
+    pub connection_flags: u32,
+    pub filters: Vec<FilterConfig>,
+    pub timeout_read: Duration,
+    pub timeout_write: Duration,
+}
+```
+
+**F. Implementation Pattern** (following DoIP pattern):
+
+1. **Connection Establishment**:
+   ```
+   1. Enumerate available PassThru devices (PassThruOpen)
+   2. Select device based on MDD configuration
+   3. Open logical channel with protocol (PassThruConnect)
+   4. Configure message filters (PassThruStartMsgFilter)
+   5. Start async read/write tasks (Tokio tasks)
+   6. Map ECU logical addresses to channels
+   7. Handle tester present via periodic messaging
+   ```
+
+2. **Message Flow** (similar to `DoipDiagGateway::send`):
+   ```rust
+   async fn send(
+       &self,
+       transmission_params: TransmissionParameters,
+       message: ServicePayload,
+       response_sender: mpsc::Sender<Result<Option<UdsResponse>, DiagServiceError>>,
+       expect_uds_reply: bool,
+   ) -> Result<(), DiagServiceError> {
+       // 1. Get J2534 device and channel
+       // 2. Convert UDS ServicePayload to PassThruMsg
+       // 3. Send via PassThruWriteMsgs
+       // 4. Wait for responses via async receive task
+       // 5. Convert PassThruMsg back to UdsResponse
+       // 6. Handle retries and timeouts
+   }
+   ```
+
+3. **Connection Handler** (similar to `handle_gateway_connection`):
+   ```rust
+   async fn handle_device_connection<T>(
+       device: J2534Target,
+       j2534_devices: &Arc<RwLock<Vec<Arc<J2534Device>>>>,
+       ecus: &Arc<HashMap<String, RwLock<T>>>,
+       ecu_channel_map: &HashMap<u16, Vec<u16>>,
+   ) -> Result<u16, J2534Error>
+   where
+       T: EcuAddressProvider + J2534ComParamProvider
+   ```
+
+**G. Dependencies** (`Cargo.toml`):
+```toml
+[workspace.dependencies]
+# J2534 FFI bindings
+j2534 = "0.3"              # OR j2534-rs
+libloading = "0.8"         # Dynamic library loading
+# Existing dependencies...
+```
+
 ### Implementation Architecture
 
 The codebase is already designed to support multiple protocols:
@@ -270,99 +434,86 @@ The codebase is already designed to support multiple protocols:
 
 2. **Protocol Enum** (`cda-interfaces/src/ecumanager.rs`):
    - Currently: `DoIp`, `DoIpDobt`
-   - Needs: `Can`, `Lin`, `Kline` variants
+   - Needs: `Can`, `Lin`, `Kline`, `J2534` variants
 
 3. **Communication Modules**:
    - Pattern: Create `cda-comm-{protocol}` crate
    - Example: `cda-comm-doip` can be used as reference
    - Each protocol implements `EcuGateway` trait
+   - J2534 follows same pattern: `cda-comm-j2534`
 
 ### Implementation Steps
 
-1. **CAN Implementation** (Recommended First):
+1. **Priority 1: J2534 PassThru API** (Recommended First for maximum hardware compatibility):
+   ```
+   cda-comm-j2534/
+   ├── src/
+   │   ├── lib.rs              # J2534DiagGateway implementation
+   │   ├── device_connection.rs # PassThru device handling
+   │   ├── channel_manager.rs  # J2534 channel management
+   │   ├── protocol_translator.rs # UDS-to-J2534 translation
+   │   └── connections.rs      # Connection pool management
+   └── Cargo.toml
+   ```
+   **Benefits**: Single implementation supports CAN, K-Line, and other protocols via standard API
+
+2. **Priority 2: Native CAN Implementation** (For direct CAN hardware):
    ```
    cda-comm-can/
    ├── src/
    │   ├── lib.rs              # CAN gateway implementation
    │   ├── isotp.rs            # ISO-TP protocol handling
    │   ├── can_frame.rs        # CAN frame structure
-   │   ├── can_socket.rs       # CAN socket abstraction
+   │   ├── can_socket.rs       # CAN socket abstraction (socketCAN)
    │   └── connections.rs      # Connection management
    └── Cargo.toml
    ```
 
-2. **Update Protocol Enum**:
-   - Add `Can`, `Lin`, `Kline` to `Protocol` enum
+3. **Update Protocol Enum**:
+   - Add `Can`, `Lin`, `Kline`, `J2534` to `Protocol` enum
    - Update protocol detection logic
 
-3. **Update Communication Parameters**:
+4. **Update Communication Parameters**:
+   - Add J2534-specific communication parameters (`J2534ComParamProvider`)
    - Add CAN-specific communication parameters
    - Add LIN-specific communication parameters
    - Add K-line-specific communication parameters
-   - Reference: ISO 14229-3 for CAN, ISO 17987 for LIN
+   - Reference: ISO 14229-3 for CAN, ISO 17987 for LIN, SAE J2534 for PassThru
 
-4. **ODX/MDD Support**:
-   - Ensure MDD files can specify CAN/LIN/K-line logical links
+5. **ODX/MDD Support**:
+   - Ensure MDD files can specify J2534/CAN/LIN/K-line logical links
    - Update ODX converter if needed
 
-5. **Testing**:
-   - CAN bus simulators (e.g., CANoe, Peak CAN)
-   - Integration tests with CAN hardware
-   - Test multi-frame messages (ISO-TP)
-
-### Hardware Requirements
-
-- **CAN**: 
-  - SocketCAN (Linux) or vendor-specific CAN interfaces
-  - Examples: Peak PCAN, Vector CAN interfaces, USB-CAN adapters
-- **LIN**: 
-  - LIN interfaces (often combined with CAN interfaces)
-- **K-line**: 
-  - K-line interfaces (OBD-II adapters, ELM327, etc.)
-
-### Documentation Updates Needed
-
-- Add CAN communication architecture docs
-- Add LIN communication architecture docs  
-- Add K-line communication architecture docs
-- Update requirements documentation
-- Add hardware setup guides
-
-### Related Standards
-
-- **ISO 14229-3**: UDS on CAN
-- **ISO 15765-2**: ISO-TP (Transport Protocol)
-- **ISO 11898**: CAN specification
-- **ISO 17987**: LIN specification
-- **ISO 9141-2**: K-line initialization
-- **ISO 14230**: K-line protocol
 
 ## Recommended Contribution Priority
 
 ### Phase 1: Critical Missing Services
-1. **CAN Protocol Support** - **HIGHEST PRIORITY** - Enables legacy vehicle support
-2. **InputOutputControlByIdentifier (0x2A)** - Explicitly noted as missing
-3. **Complete Faults Implementation** - Clear DTCs functionality
-4. **Bulk Data Management** - Required by SOVD standard
+1. **J2534 PassThru API Support** - **HIGHEST PRIORITY** - Universal hardware interface for all protocols (CAN, K-Line, etc.)
+2. **CAN Protocol Support** - **HIGH PRIORITY** - Direct CAN support for native hardware (alternative/complement to J2534)
+3. **InputOutputControlByIdentifier (0x2A)** - Explicitly noted as missing
+4. **Complete Faults Implementation** - Clear DTCs functionality
+5. **Bulk Data Management** - Required by SOVD standard
 
 ### Phase 2: Important Standard Services
-4. **ReadMemoryByAddress (0x23)** - Useful for debugging/calibration
-5. **WriteMemoryByAddress (0x3D)** - Useful for calibration
-6. **RequestUpload (0x35)** - Complement to download functionality
+6. **ReadMemoryByAddress (0x23)** - Useful for debugging/calibration
+7. **WriteMemoryByAddress (0x3D)** - Useful for calibration
+8. **RequestUpload (0x35)** - Complement to download functionality
+9. **LIN Protocol Support** - Body electronics and lower-cost ECUs
+10. **K-Line Protocol Support** - Legacy vehicle support
 
 ### Phase 3: Advanced Features
-7. **ResponseOnEvent (0x86)** - Real-time event monitoring
-8. **Functional Communication** - Group-based operations
-9. **DynamicallyDefineDataIdentifier (0x2C)** - Dynamic data handling
+11. **ResponseOnEvent (0x86)** - Real-time event monitoring
+12. **Functional Communication** - Group-based operations
+13. **DynamicallyDefineDataIdentifier (0x2C)** - Dynamic data handling
 
 ### Phase 4: Extended Services
-10. **AccessTimingParameter (0x83)** - Timing configuration
-11. **SecuredDataTransmission (0x84)** - Security enhancements
-12. **LinkControl (0x87)** - Link parameter control
-13. **ReadScalingDataByIdentifier (0x24)** - Scaling information
+14. **AccessTimingParameter (0x83)** - Timing configuration
+15. **SecuredDataTransmission (0x84)** - Security enhancements
+16. **LinkControl (0x87)** - Link parameter control
+17. **ReadScalingDataByIdentifier (0x24)** - Scaling information
 
 ### Phase 5: Parameter Type Support
-14. **Complete Parameter Type Support** - All ODX parameter types
+18. **Complete Parameter Type Support** - All ODX parameter types
 
 ## Implementation Guidelines
 
@@ -398,40 +549,4 @@ The codebase is already designed to support multiple protocols:
    - Unit tests for UDS layer
    - Integration tests for SOVD endpoints
    - Test with ECU simulator
-
-## References
-
-### UDS Standards
-- **ISO 14229-1**: Unified diagnostic services (UDS) - Specification and requirements
-- **ISO 14229-2**: Unified diagnostic services (UDS) - Session layer services
-- **ISO 14229-3**: Unified diagnostic services (UDS) - Implementation for CAN
-- **ISO 14229-5**: Unified diagnostic services (UDS) - Implementation for DoIP
-
-### Transport Protocol Standards
-- **ISO 13400**: Diagnostics over IP (DoIP)
-- **ISO 15765-2**: ISO-TP (Transport Protocol for CAN)
-- **ISO 11898**: CAN (Controller Area Network) specification
-- **ISO 17987**: LIN (Local Interconnect Network) specification
-- **ISO 9141-2**: K-line initialization
-- **ISO 14230**: K-line protocol (Keyword Protocol 2000)
-
-### SOVD Standards
-- **ISO 17978-1**: Service-Oriented Vehicle Diagnostics (SOVD) - Part 1: General information and use case definition
-- **ISO 17978-3**: Service-Oriented Vehicle Diagnostics (SOVD) - Part 3: API specification
-
-## Getting Started
-
-1. Review the existing implementation patterns in the codebase
-2. Check the architecture documentation for design decisions
-3. Review similar service implementations (e.g., RoutineControl for Operations)
-4. Create an issue or discussion in the GitHub repository
-5. Follow the coding style guidelines (`CODESTYLE.md`)
-6. Write tests alongside implementation
-7. Update documentation
-
-## Contact
-
-For questions or to discuss contributions:
-- GitHub Issues: https://github.com/eclipse-opensovd/classic-diagnostic-adapter/issues
-- Mailing List: opensovd-dev@eclipse.org
 
