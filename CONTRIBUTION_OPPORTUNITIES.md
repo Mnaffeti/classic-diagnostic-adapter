@@ -73,16 +73,8 @@ This document identifies missing UDS services and SOVD endpoints that need to be
   - Add support for scaling data reads
   - Return scaling information in response
 
-#### 5. DynamicallyDefineDataIdentifier (SID 0x2C)
-- **Status**: Not implemented
-- **ISO 14229 Reference**: Section 8.3.1.4
-- **SOVD Mapping**: Could map to `/operations/define-data-identifier` or `/data/{data-identifier}` with dynamic creation
-- **Use Case**: Dynamically define data identifiers at runtime
-- **Implementation Requirements**:
-  - Support subfunctions: DefineByIdentifier, DefineByMemoryAddress, ClearDynamicallyDefinedDataIdentifier
-  - Handle dynamic data identifier lifecycle
 
-#### 6. RequestUpload (SID 0x35)
+#### 5. RequestUpload (SID 0x35)
 - **Status**: Not implemented
 - **ISO 14229 Reference**: Section 8.3.1.5
 - **SOVD Mapping**: Could map to `/x-sovd2uds-upload/requestupload` (mirror of download)
@@ -92,46 +84,6 @@ This document identifies missing UDS services and SOVD endpoints that need to be
   - Add upload endpoints: `/x-sovd2uds-upload/requestupload`, `/x-sovd2uds-upload/uploadtransfer`, `/x-sovd2uds-upload/transferexit`
   - Handle upload data transfer similar to download
 
-### Lower Priority - Advanced/Extended Services
-
-#### 7. AccessTimingParameter (SID 0x83)
-- **Status**: Not implemented
-- **ISO 14229 Reference**: Section 8.3.3.1
-- **SOVD Mapping**: Could map to `/modes/timing` or `/operations/timing-parameter`
-- **Use Case**: Set/get timing parameters for diagnostic communication
-- **Implementation Requirements**:
-  - Support subfunctions: SetTimingParametersToGivenValues, ReadCurrentlyActiveTimingParameters, SetTimingParametersToDefaultValues
-  - Handle timing parameter configuration
-
-#### 8. SecuredDataTransmission (SID 0x84)
-- **Status**: Not implemented
-- **ISO 14229 Reference**: Section 8.3.3.2
-- **SOVD Mapping**: Could be handled transparently or via `/operations/secured-transmission`
-- **Use Case**: Encrypted/secure data transmission
-- **Implementation Requirements**:
-  - Support secure data transmission protocols
-  - Handle encryption/decryption
-  - May require security plugin integration
-
-#### 9. ResponseOnEvent (SID 0x86)
-- **Status**: Not implemented
-- **ISO 14229 Reference**: Section 8.3.3.3
-- **SOVD Mapping**: Could map to `/operations/event-subscription` or `/modes/event-monitoring`
-- **Use Case**: Subscribe to ECU events (DTCs, data changes, etc.)
-- **Implementation Requirements**:
-  - Support event subscription management
-  - Handle asynchronous event notifications
-  - Support multiple event types: OnDTCStatusChange, OnTimerInterrupt, OnChangeOfDataIdentifier, etc.
-  - WebSocket or similar for real-time event delivery
-
-#### 10. LinkControl (SID 0x87)
-- **Status**: Not implemented
-- **ISO 14229 Reference**: Section 8.3.3.4
-- **SOVD Mapping**: Could map to `/modes/link-control` or `/operations/link-control`
-- **Use Case**: Control communication link parameters
-- **Implementation Requirements**:
-  - Support subfunctions: VerifyBaudrateTransitionWithFixedBaudrate, VerifyBaudrateTransitionWithSpecificBaudrate, TransitionBaudrate
-  - Handle baudrate transitions (mainly for CAN, less relevant for DoIP)
 
 ## Incomplete Implementations
 
@@ -214,15 +166,6 @@ This document identifies missing UDS services and SOVD endpoints that need to be
   - Support multiple categories (e.g., `flashfiles`, `calibration`, `logs`)
   - Category-specific access controls
   
-- **MIME Type Handling**:
-  - Automatic MIME type detection
-  - Content-Type headers in responses
-  
-- **Security Restrictions**:
-  - Path-based access control (as per requirements: "source of data must be restrictable to a path and its subdirectories via configuration")
-  - Prevent directory traversal attacks
-  - File size limits
-  - Allowed file type restrictions per category
 
 #### Example Use Case - ECU Flashing:
 1. **Upload**: `POST /bulk-data/flashfiles` - Upload ECU firmware file
