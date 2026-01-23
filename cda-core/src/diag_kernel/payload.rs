@@ -42,7 +42,7 @@ impl<'a> Payload<'a> {
     }
 
     pub(in crate::diag_kernel) fn set_bytes_to_skip(&mut self, count: usize) {
-        self.bytes_to_skip += count;
+        self.bytes_to_skip = self.bytes_to_skip.saturating_add(count);
     }
 
     pub(in crate::diag_kernel) fn bytes_to_skip(&self) -> usize {
@@ -72,20 +72,21 @@ impl<'a> Payload<'a> {
         }
     }
 
-    pub(in crate::diag_kernel) fn consume(&mut self) {
-        let advance_len = self.last_read_byte_pos + self.bytes_to_skip;
-        if self.pos() + advance_len > self.data.len() {
+    pub(in crate::diag_kernel) fn consume(&mut self) -> usize {
+        let advance_len = self.last_read_byte_pos.saturating_add(self.bytes_to_skip);
+        if self.pos().saturating_add(advance_len) > self.data.len() {
             self.current_index = self.data.len(); // Move to the end if we exceed
         } else {
-            self.current_index += advance_len;
+            self.current_index = self.current_index.saturating_add(advance_len);
         }
         self.last_read_byte_pos = 0;
         self.bytes_to_skip = 0;
+        advance_len
     }
 
     pub(in crate::diag_kernel) fn len(&self) -> usize {
         if let Some(&(start, end)) = self.slices.back() {
-            end - start
+            end.saturating_sub(start)
         } else {
             self.data.len()
         }
@@ -126,8 +127,8 @@ impl<'a> Payload<'a> {
         }
 
         // Convert relative positions to absolute positions
-        let absolute_start = current_start + start;
-        let absolute_end = (current_start + end).min(self.data.len());
+        let absolute_start = current_start.saturating_add(start);
+        let absolute_end = current_start.saturating_add(end).min(self.data.len());
 
         self.slices.push_back((absolute_start, absolute_end));
         Ok(())
@@ -148,8 +149,8 @@ mod tests {
     #[test]
     fn test_payload_type() {
         let raw_payload = vec![
-            0xa3, 0x4f, 0x9c, 0xd1, 0x7e, 0x2b, 0x88, 0x5a, 0xb4, 0x3d, 0xe7, 0x0f, 0x61, 0x92,
-            0xbc, 0x47, 0x19, 0xfa, 0x33, 0x6d,
+            0xA3, 0x4F, 0x9C, 0xD1, 0x7E, 0x2B, 0x88, 0x5A, 0xB4, 0x3D, 0xE7, 0x0F, 0x61, 0x92,
+            0xBC, 0x47, 0x19, 0xFA, 0x33, 0x6D,
         ];
         let mut payload = super::Payload::new(&raw_payload);
         assert_eq!(payload.len(), 20);

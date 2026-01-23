@@ -13,20 +13,19 @@
 
 use std::sync::Arc;
 
-use cda_interfaces::{DiagServiceError, DoipGatewaySetupError};
+use cda_core::DiagServiceResponseStruct;
+use cda_interfaces::dlt_ctx;
 use cda_plugin_security::{DefaultSecurityPlugin, DefaultSecurityPluginData};
-use cda_tracing::TracingSetupError;
 use clap::Parser;
 use futures::future::FutureExt;
-use opensovd_cda_lib::{config::configfile::ConfigSanity, shutdown_signal};
-use thiserror::Error;
-use tokio::sync::mpsc;
-use tracing_subscriber::layer::SubscriberExt as _;
-
-use crate::AppError::{
-    ConfigurationError, ConnectionError, DataError, InitializationFailed, NotFound, ResourceError,
-    RuntimeError, ServerError,
+use opensovd_cda_lib::{
+    AppError, cda_version,
+    config::configfile::{ConfigSanity, Configuration},
+    setup_tracing, shutdown_signal,
 };
+
+#[cfg(feature = "health")]
+const MAIN_HEALTH_COMPONENT_KEY: &str = "main";
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -65,100 +64,17 @@ struct AppArgs {
 
     #[arg(long)]
     log_file_name: Option<String>,
-}
 
-#[derive(Error, Debug)]
-pub enum AppError {
-    #[error("Initialization failed `{0}`")]
-    InitializationFailed(String),
-    #[error("Resource error: `{0}`")]
-    ResourceError(String),
-    #[error("Connection error `{0}`")]
-    ConnectionError(String),
-    #[error("Configuration error `{0}`")]
-    ConfigurationError(String),
-    #[error("Data error `{0}`")]
-    DataError(String),
-    #[error("Error during execution `{0}`")]
-    RuntimeError(String),
-    #[error("Not found: `{0}`")]
-    NotFound(String),
-    #[error("Server error: `{0}`")]
-    ServerError(String),
-}
-
-impl From<TracingSetupError> for AppError {
-    fn from(value: TracingSetupError) -> Self {
-        match value {
-            TracingSetupError::ResourceCreationFailed(_) => ResourceError(value.to_string()),
-            TracingSetupError::SubscriberInitializationFailed(_) => {
-                InitializationFailed(value.to_string())
-            }
-        }
-    }
-}
-
-impl From<DoipGatewaySetupError> for AppError {
-    fn from(value: DoipGatewaySetupError) -> Self {
-        match value {
-            DoipGatewaySetupError::InvalidAddress(_) => ConnectionError(value.to_string()),
-
-            DoipGatewaySetupError::SocketCreationFailed(_)
-            | DoipGatewaySetupError::PortBindFailed(_) => InitializationFailed(value.to_string()),
-
-            DoipGatewaySetupError::InvalidConfiguration(_) => ConfigurationError(value.to_string()),
-
-            DoipGatewaySetupError::ResourceError(_) => ResourceError(value.to_string()),
-
-            DoipGatewaySetupError::ServerError(_) => ServerError(value.to_string()),
-        }
-    }
-}
-
-impl From<DiagServiceError> for AppError {
-    fn from(value: DiagServiceError) -> Self {
-        match value {
-            DiagServiceError::RequestNotSupported(_)
-            | DiagServiceError::BadPayload(_)
-            | DiagServiceError::ConnectionClosed
-            | DiagServiceError::UnexpectedResponse(_)
-            | DiagServiceError::EcuOffline(_)
-            | DiagServiceError::NoResponse(_)
-            | DiagServiceError::SendFailed(_)
-            | DiagServiceError::InvalidAddress(_)
-            | DiagServiceError::InvalidRequest(_)
-            | DiagServiceError::Timeout => ConnectionError(value.to_string()),
-
-            DiagServiceError::ParameterConversionError(_)
-            | DiagServiceError::UnknownOperation
-            | DiagServiceError::UdsLookupError(_)
-            | DiagServiceError::VariantDetectionError(_)
-            | DiagServiceError::AccessDenied(_)
-            | DiagServiceError::InvalidSession(_)
-            | DiagServiceError::Nack(_) => RuntimeError(value.to_string()),
-
-            DiagServiceError::InvalidSecurityPlugin => ConfigurationError(value.to_string()),
-
-            DiagServiceError::ResourceError(_) => ResourceError(value.to_string()),
-
-            DiagServiceError::NotFound(Some(_)) => NotFound(value.to_string()),
-
-            DiagServiceError::NotFound(None) => NotFound("Resource could not be found.".to_owned()),
-
-            DiagServiceError::DataError(_)
-            | DiagServiceError::InvalidDatabase(_)
-            | DiagServiceError::DatabaseEntryNotFound(_)
-            | DiagServiceError::NotEnoughData { .. } => DataError(value.to_string()),
-
-            DiagServiceError::SetupError(_) | DiagServiceError::ConfigurationError(_) => {
-                InitializationFailed(value.to_string())
-            }
-        }
-    }
+    #[arg(long)]
+    exit_no_database_loaded: Option<bool>,
 }
 
 #[tokio::main]
-#[tracing::instrument]
+#[tracing::instrument(
+    fields(
+        dlt_context = dlt_ctx!("MAIN"),
+    )
+)]
 async fn main() -> Result<(), AppError> {
     let args = AppArgs::parse();
     let mut config = opensovd_cda_lib::config::load_config().unwrap_or_else(|e| {
@@ -170,57 +86,8 @@ async fn main() -> Result<(), AppError> {
 
     args.update_config(&mut config);
 
-    let tracing = cda_tracing::new();
-    let mut layers = vec![];
-    layers.push(cda_tracing::new_term_subscriber(&config.logging));
-    #[cfg(feature = "tokio-tracing")]
-    layers.push(cda_tracing::new_tokio_tracing(
-        &config.logging.tokio_tracing,
-    )?);
-    let _otel_guard = if config.logging.otel.enabled {
-        println!(
-            "Starting OpenTelemetry tracing with {}",
-            config.logging.otel.endpoint
-        );
-        let (guard, metrics_layer, otel_layer) =
-            cda_tracing::new_otel_subscriber(&config.logging.otel)?;
-        layers.push(metrics_layer);
-        layers.push(otel_layer);
-        Some(guard)
-    } else {
-        None
-    };
-    let _guard = if config.logging.log_file_config.enabled {
-        let (guard, file_layer) =
-            cda_tracing::new_file_subscriber(&config.logging.log_file_config)?;
-        layers.push(file_layer);
-        Some(guard)
-    } else {
-        None
-    };
-
-    cda_tracing::init_tracing(tracing.with(layers))?;
-
-    tracing::info!("Starting CDA...");
-
-    let database_path = config.databases_path.clone();
-
-    let flash_files_path = config.flash_files_path.clone();
-
-    let protocol = if config.onboard_tester {
-        cda_interfaces::Protocol::DoIpDobt
-    } else {
-        cda_interfaces::Protocol::DoIp
-    };
-
-    let (databases, file_managers) = opensovd_cda_lib::load_databases::<DefaultSecurityPluginData>(
-        &database_path,
-        protocol,
-        config.com_params,
-        config.database_naming_convention,
-        config.flat_buf,
-    )
-    .await;
+    let _tracing_guards = setup_tracing(&config)?;
+    tracing::info!("Starting CDA - version {}", cda_version());
 
     let webserver_config = cda_sovd::WebServerConfig {
         host: config.server.address.clone(),
@@ -229,63 +96,94 @@ async fn main() -> Result<(), AppError> {
 
     let clonable_shutdown_signal = shutdown_signal().shared();
 
-    let (variant_detection_tx, variant_detection_rx) = mpsc::channel(50);
+    let (dynamic_router, webserver_task) =
+        cda_sovd::launch_webserver(webserver_config.clone(), clonable_shutdown_signal.clone())
+            .await?;
 
-    let databases = Arc::new(databases);
-    let diagnostic_gateway = match opensovd_cda_lib::create_diagnostic_gateway(
-        Arc::clone(&databases),
-        &config.doip.tester_address,
-        &config.doip.tester_subnet,
-        config.doip.gateway_port,
-        variant_detection_tx,
-        clonable_shutdown_signal.clone(),
-    )
-    .await
-    {
-        Ok(gateway) => gateway,
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to create diagnostic gateway");
-            return Err(e.into());
+    #[cfg(feature = "health")]
+    let (health_state, main_health_provider) = if config.health.enabled {
+        let health_state =
+            cda_health::add_health_routes(&dynamic_router, cda_version().to_owned()).await;
+        let main_health_provider = Arc::new(cda_health::StatusHealthProvider::new(
+            cda_health::Status::Starting,
+        ));
+
+        if let Err(e) = health_state
+            .register_provider(
+                MAIN_HEALTH_COMPONENT_KEY,
+                Arc::clone(&main_health_provider) as Arc<dyn cda_health::HealthProvider>,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "Failed to register main health provider");
         }
+        (Some(health_state), Some(main_health_provider))
+    } else {
+        (None, None)
     };
 
-    let uds =
-        opensovd_cda_lib::create_uds_manager(diagnostic_gateway, databases, variant_detection_rx);
+    #[cfg(not(feature = "health"))]
+    let (health_state, main_health_provider): (
+        Option<cda_health::HealthState>,
+        Option<Arc<cda_health::StatusHealthProvider>>,
+    ) = (None, None);
 
-    match opensovd_cda_lib::start_webserver::<_, DefaultSecurityPlugin>(
-        flash_files_path,
-        file_managers,
-        webserver_config,
-        uds,
-        clonable_shutdown_signal,
+    tracing::debug!("Webserver is running. Loading sovd routes...");
+
+    let vehicle_data = opensovd_cda_lib::load_vehicle_data::<_, DefaultSecurityPluginData>(
+        &config,
+        clonable_shutdown_signal.clone(),
+        health_state.as_ref(),
     )
-    .await
-    {
-        Ok(Ok(())) => tracing::info!("Shutting down..."),
-        Ok(Err(e)) => {
-            tracing::error!(error = ?e, "Failed to start webserver");
-            std::process::exit(1);
-        }
-        Err(je) => {
-            if je.is_panic() {
-                let reason = je.into_panic();
-                tracing::error!(panic_reason = ?reason, "Webserver thread panicked");
-                std::process::exit(1);
-            }
-        }
+    .await?;
+
+    if vehicle_data.databases.is_empty() && config.database.exit_no_database_loaded {
+        return Err(AppError::ResourceError(
+            "No database loaded, exiting as configured".to_string(),
+        ));
     }
+
+    cda_sovd::add_vehicle_routes::<DiagServiceResponseStruct, _, _, DefaultSecurityPlugin>(
+        &dynamic_router,
+        vehicle_data.uds_manager,
+        config.flash_files_path.clone(),
+        vehicle_data.file_managers,
+        vehicle_data.locks,
+        config.functional_description,
+    )
+    .await?;
+    cda_sovd::add_openapi_routes(&dynamic_router, &webserver_config).await;
+
+    tracing::info!("CDA fully initialized and ready to serve requests");
+    if let Some(provider) = main_health_provider {
+        provider.update_status(cda_health::Status::Up).await;
+    }
+
+    // Wait for shutdown signal
+    clonable_shutdown_signal.await;
+    tracing::info!("Shutting down...");
+    webserver_task
+        .await
+        .map_err(|e| AppError::RuntimeError(format!("Webserver task join error: {e}")))?;
 
     Ok(())
 }
 
 impl AppArgs {
-    #[tracing::instrument(skip(self, config))]
-    fn update_config(self, config: &mut opensovd_cda_lib::config::configfile::Configuration) {
+    #[tracing::instrument(skip(self, config),
+        fields(
+            dlt_context = dlt_ctx!("MAIN"),
+        )
+    )]
+    fn update_config(self, config: &mut Configuration) {
         if let Some(onboard_tester) = self.onboard_tester {
             config.onboard_tester = onboard_tester;
         }
         if let Some(databases_path) = self.databases_path {
-            config.databases_path = databases_path;
+            config.database.path = databases_path;
+        }
+        if let Some(exit_no_database_loaded) = self.exit_no_database_loaded {
+            config.database.exit_no_database_loaded = exit_no_database_loaded;
         }
         if let Some(flash_files_path) = self.flash_files_path {
             config.flash_files_path = flash_files_path;

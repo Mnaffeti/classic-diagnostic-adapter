@@ -73,6 +73,8 @@ pub trait EcuAddressProvider: Send + Sync + 'static {
     fn logical_functional_address(&self) -> u16;
     #[must_use]
     fn ecu_name(&self) -> String;
+    #[must_use]
+    fn logical_address_eq<T: EcuAddressProvider>(&self, other: &T) -> bool;
 }
 
 pub trait EcuManager:
@@ -85,6 +87,11 @@ pub trait EcuManager:
     + 'static
 {
     type Response: DiagServiceResponse;
+    /// This indicates whether the `EcuManager` is representing an ECU or
+    /// a functional description only.
+    #[must_use]
+    fn is_physical_ecu(&self) -> bool;
+
     #[must_use]
     fn variant(&self) -> EcuVariant;
 
@@ -181,7 +188,11 @@ pub trait EcuManager:
     /// setting the session and security access back to the default value.
     /// To do this the defaults have to looked up which might fail.
     /// In that case the error is forwarded
-    fn set_session(&self, session: &str, expiration: Duration) -> Result<(), DiagServiceError>;
+    fn set_session(
+        &self,
+        session: &str,
+        expiration: Option<Duration>,
+    ) -> Result<(), DiagServiceError>;
     /// Update the internally tracked ecu security access.
     /// Has to be called after changing the session, to make sure the transition lookup keep working
     /// # Errors
@@ -192,7 +203,7 @@ pub trait EcuManager:
     fn set_security_access(
         &self,
         security_access: &str,
-        expiration: Duration,
+        expiration: Option<Duration>,
     ) -> Result<(), DiagServiceError>;
     /// Lookup the transition between the active session and the requested one.
     /// # Errors
@@ -228,6 +239,10 @@ pub trait EcuManager:
     /// Will return `DiagServiceError` if the session cannot be found in the database
     /// or no session is currently set or no variant is loaded.
     fn session(&self) -> Result<String, DiagServiceError>;
+    /// Retrieves the name of the default ecu session
+    /// # Errors
+    /// Will return `DiagServiceError` if no default session is found in the database
+    fn default_session(&self) -> Result<String, DiagServiceError>;
     /// Retrieves the name of the current ecu security level,
     /// i.e. `level_42`
     /// The exact values depends on the ECU parameterization.
@@ -235,6 +250,10 @@ pub trait EcuManager:
     /// Will return `DiagServiceError` if the security access cannot be found in the database
     /// or no security access is currently set or no variant is loaded.
     fn security_access(&self) -> Result<String, DiagServiceError>;
+    /// Retrieves the name of the default ecu security level,
+    /// # Errors
+    /// Will return `DiagServiceError` if no default session is found in the database
+    fn default_security_access(&self) -> Result<String, DiagServiceError>;
     /// Lookup a service by a given function class name and service id.
     /// # Errors
     /// Will return `Err` if the lookup failed
@@ -270,6 +289,15 @@ pub trait EcuManager:
         service: &DiagComm,
         security_plugin: &DynamicPlugin,
     ) -> impl Future<Output = Result<(), DiagServiceError>> + Send;
+    /// Retrieve the revision of the ECU variant if available,
+    /// otherwise return 0.0.0
+    fn revision(&self) -> String;
+}
+
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+pub enum EcuManagerType {
+    Ecu,
+    FunctionalDescription,
 }
 
 impl Protocol {

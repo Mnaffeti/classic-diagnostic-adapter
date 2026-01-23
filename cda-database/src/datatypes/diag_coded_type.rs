@@ -184,6 +184,17 @@ impl DiagCodedType {
     }
 
     #[must_use]
+    pub fn bit_len(&self) -> Option<BitLength> {
+        match &self.type_ {
+            DiagCodedTypeVariant::LeadingLengthInfo(bit_len) => Some(*bit_len),
+            DiagCodedTypeVariant::MinMaxLength(_min_max) => None,
+            DiagCodedTypeVariant::StandardLength(standard_length) => {
+                Some(standard_length.bit_length)
+            }
+        }
+    }
+
+    #[must_use]
     pub fn type_(&self) -> &DiagCodedTypeVariant {
         &self.type_
     }
@@ -235,7 +246,7 @@ impl DiagCodedType {
             return Ok((Vec::new(), 0));
         }
 
-        let end_pos = start_pos + (bit_len.div_ceil(8));
+        let end_pos = start_pos.saturating_add(bit_len.div_ceil(8));
         if uds_payload.len() < end_pos {
             return Err(DiagServiceError::NotEnoughData {
                 expected: end_pos,
@@ -275,7 +286,10 @@ impl DiagCodedType {
         mmlt: &MinMaxLengthType,
     ) -> Result<(usize, usize, Option<Mask>), DiagServiceError> {
         let max_end = if let Some(max_length) = mmlt.max_length {
-            usize::min(byte_pos + max_length as usize, uds_payload.len())
+            usize::min(
+                byte_pos.saturating_add(max_length as usize),
+                uds_payload.len(),
+            )
         } else {
             uds_payload.len()
         };
@@ -290,25 +304,28 @@ impl DiagCodedType {
                 match self.base_datatype {
                     DataType::Unicode2String => {
                         while end_pos < max_end {
-                            if end_pos - byte_pos >= mmlt.min_length as usize
-                                && end_pos + 1 < uds_payload.len()
+                            if end_pos.saturating_sub(byte_pos) >= mmlt.min_length as usize
+                                && end_pos.saturating_add(1) < uds_payload.len()
                                 && uds_payload.get(end_pos).is_some_and(|&b| b == 0)
-                                && uds_payload.get(end_pos + 1).is_some_and(|&b| b == 0)
+                                && uds_payload
+                                    .get(end_pos.saturating_add(1))
+                                    .is_some_and(|&b| b == 0)
                             {
                                 break; // Found UTF-16 null terminator
                             }
 
-                            end_pos += 2; // Unicode2String is 2 bytes per character
+                            // Unicode2String is 2 bytes per character
+                            end_pos = end_pos.saturating_add(2);
                         }
                     }
                     _ => {
                         while end_pos < max_end {
-                            if end_pos - byte_pos >= mmlt.min_length as usize
+                            if end_pos.saturating_sub(byte_pos) >= mmlt.min_length as usize
                                 && uds_payload.get(end_pos).is_some_and(|&b| b == 0)
                             {
                                 break; // Found ASCII/UTF-8 null terminator
                             }
-                            end_pos += 1;
+                            end_pos = end_pos.saturating_add(1);
                         }
                     }
                 }
@@ -327,25 +344,28 @@ impl DiagCodedType {
                 match self.base_datatype {
                     DataType::Unicode2String => {
                         while end_pos < max_end {
-                            if end_pos + 1 < uds_payload.len()
-                                && (end_pos - byte_pos) >= mmlt.min_length as usize
-                                && uds_payload.get(end_pos).is_some_and(|&b| b == 0xff)
-                                && uds_payload.get(end_pos + 1).is_some_and(|&b| b == 0xff)
+                            if end_pos.saturating_add(1) < uds_payload.len()
+                                && end_pos.saturating_sub(byte_pos) >= mmlt.min_length as usize
+                                && uds_payload.get(end_pos).is_some_and(|&b| b == 0xFF)
+                                && uds_payload
+                                    .get(end_pos.saturating_add(1))
+                                    .is_some_and(|&b| b == 0xFF)
                             {
                                 break; // Found UTF-16 null terminator
                             }
 
-                            end_pos += 2; // Unicode2String is 2 bytes per character
+                            // Unicode2String is 2 bytes per character
+                            end_pos = end_pos.saturating_add(2);
                         }
                     }
                     _ => {
                         while end_pos < max_end {
-                            if (end_pos - byte_pos) >= mmlt.min_length as usize
-                                && uds_payload.get(end_pos).is_some_and(|&b| b == 0xff)
+                            if end_pos.saturating_sub(byte_pos) >= mmlt.min_length as usize
+                                && uds_payload.get(end_pos).is_some_and(|&b| b == 0xFF)
                             {
                                 break; // Found ASCII/UTF-8 null terminator
                             }
-                            end_pos += 1;
+                            end_pos = end_pos.saturating_add(1);
                         }
                     }
                 }
@@ -354,7 +374,7 @@ impl DiagCodedType {
             }
         };
 
-        let len = end_pos - byte_pos;
+        let len = end_pos.saturating_sub(byte_pos);
         if len < mmlt.min_length as usize {
             return Err(DiagServiceError::BadPayload(format!(
                 "Not enough data in payload, needed at least {} bytes, got {} bytes",
@@ -362,7 +382,11 @@ impl DiagCodedType {
             )));
         }
 
-        Ok(((end_pos - byte_pos) * 8, byte_pos, None))
+        Ok((
+            end_pos.saturating_sub(byte_pos).saturating_mul(8),
+            byte_pos,
+            None,
+        ))
     }
 
     fn pos_info_leading_len(
@@ -394,16 +418,19 @@ impl DiagCodedType {
 
         // The bits of the leading length are not part of the result.
         // The data bytes start at the byte edge to the length.
-        let start_pos = byte_pos + length_info_bytes.len();
-        let end_pos = start_pos + len;
+        let start_pos = byte_pos.saturating_add(length_info_bytes.len());
+        let end_pos = start_pos.saturating_add(len);
         if end_pos > uds_payload.len() {
-            return Err(DiagServiceError::BadPayload(format!(
-                "Not enough data in payload: need {} bytes, but only {} bytes available",
-                end_pos,
-                uds_payload.len()
-            )));
+            return Err(DiagServiceError::NotEnoughData {
+                expected: end_pos,
+                actual: uds_payload.len(),
+            });
         }
-        Ok(((end_pos - start_pos) * 8, start_pos, None))
+        Ok((
+            end_pos.saturating_sub(start_pos).saturating_mul(8),
+            start_pos,
+            None,
+        ))
     }
 
     #[inline]
@@ -478,8 +505,8 @@ impl DiagCodedType {
                 // Shift the length up this amount of bits to put the relevant data into
                 // the MSBs of the length usize.
                 let len_byte_count = bit_len.div_ceil(8);
-                let len_bit_len = len_byte_count * 8;
-                let mut data = (input_data.len() << (usize::BITS - len_bit_len))
+                let len_bit_len = len_byte_count.saturating_mul(8);
+                let mut data = (input_data.len() << usize::BITS.saturating_sub(len_bit_len))
                     .to_be_bytes()
                     .get(0..len_byte_count as usize)
                     .ok_or_else(|| {
@@ -494,7 +521,7 @@ impl DiagCodedType {
                 }
 
                 data.append(&mut input_data);
-                let (packed, len) = pack_data(data.len() * 8, 0, None, &data)?;
+                let (packed, len) = pack_data(data.len().saturating_mul(8), 0, None, &data)?;
                 (packed, len, None)
             }
             DiagCodedTypeVariant::MinMaxLength(mmlt) => {
@@ -503,23 +530,23 @@ impl DiagCodedType {
                 let (packed, len) = match mmlt.termination {
                     Termination::EndOfPdu => {
                         // No special termination, just pack the data as is
-                        pack_data(input_data.len() * 8, 0, None, &input_data)
+                        pack_data(input_data.len().saturating_mul(8), 0, None, &input_data)
                     }
                     Termination::Zero => {
                         if self.base_datatype == DataType::Unicode2String {
-                            input_data.append(&mut vec![0_u8, 0_u8]);
+                            input_data.append(&mut vec![0u8, 0u8]);
                         } else {
-                            input_data.push(0_u8);
+                            input_data.push(0u8);
                         }
-                        pack_data(input_data.len() * 8, 0, None, &input_data)
+                        pack_data(input_data.len().saturating_mul(8), 0, None, &input_data)
                     }
                     Termination::HexFF => {
                         if self.base_datatype == DataType::Unicode2String {
-                            input_data.append(&mut vec![0xff_u8, 0xff_u8]);
+                            input_data.append(&mut vec![0xFFu8, 0xFFu8]);
                         } else {
-                            input_data.push(0xff_u8);
+                            input_data.push(0xFFu8);
                         }
-                        pack_data(input_data.len() * 8, 0, None, &input_data)
+                        pack_data(input_data.len().saturating_mul(8), 0, None, &input_data)
                     }
                 }?;
 
@@ -534,17 +561,24 @@ impl DiagCodedType {
 
                 let (packed, len) =
                     pack_data(slt.bit_length as usize, 0, mask.as_ref(), &input_data)?;
+                if len > slt.bit_length as usize {
+                    return Err(DiagServiceError::BadPayload(format!(
+                        "StandardLengthType input data length {len} bits exceeds allowed length \
+                         {} bits",
+                        slt.bit_length
+                    )));
+                }
                 (packed, len, mask)
             }
         };
 
-        let byte_count = (bit_pos + bit_len).div_ceil(8);
+        let byte_count = bit_pos.saturating_add(bit_len).div_ceil(8);
         // Ensure PDU cut-out exists and is zero-initialized
-        if uds_payload.len() < byte_pos + byte_count {
-            uds_payload.resize(byte_pos + byte_count, 0);
+        if uds_payload.len() < byte_pos.saturating_add(byte_count) {
+            uds_payload.resize(byte_pos.saturating_add(byte_count), 0);
         }
         let mut pdu_cut_out = uds_payload
-            .get(byte_pos..byte_pos + byte_count)
+            .get(byte_pos..byte_pos.saturating_add(byte_count))
             .ok_or_else(|| {
                 DiagServiceError::BadPayload("PDU cut-out slice out of bounds".to_owned())
             })?
@@ -564,7 +598,7 @@ impl DiagCodedType {
         inject_bits(bit_len, bit_pos, &mut pdu_cut_out, &packed_bytes)?;
         normalize_byte_order(&mut pdu_cut_out, self.byte_order());
         uds_payload
-            .get_mut(byte_pos..byte_pos + byte_count)
+            .get_mut(byte_pos..byte_pos.saturating_add(byte_count))
             .ok_or_else(|| {
                 DiagServiceError::BadPayload("PDU target slice out of bounds".to_owned())
             })?
@@ -642,9 +676,9 @@ fn inject_bits(
         ));
     }
 
-    let byte_count = (bit_pos + bit_len).div_ceil(8);
-    for i in 0..bit_len.min(source_data.len() * 8) {
-        let src_byte_index = source_data.len() - (i / 8) - 1;
+    let byte_count = bit_pos.saturating_add(bit_len).div_ceil(8);
+    for i in 0..bit_len.min(source_data.len().saturating_mul(8)) {
+        let src_byte_index = source_data.len().saturating_sub(i / 8).saturating_sub(1);
         let src_bit_offset = i % 8;
         let bit_value = source_data
             .get(src_byte_index)
@@ -653,14 +687,14 @@ fn inject_bits(
             })
             .map(|&byte| (byte >> src_bit_offset) & 1)?;
 
-        let dst_byte_index = byte_count - 1 - (bit_pos / 8);
+        let dst_byte_index = byte_count.saturating_sub(1).saturating_sub(bit_pos / 8);
         let dst_bit_offset = bit_pos % 8;
         if dst_byte_index >= dst_data.len() {
             break;
         }
 
         set_bit_checked(dst_data, dst_byte_index, dst_bit_offset, bit_value, false)?;
-        bit_pos += 1;
+        bit_pos = bit_pos.saturating_add(1);
     }
     Ok(())
 }
@@ -682,19 +716,22 @@ fn apply_bit_mask(
     bit_pos: usize,
 ) -> Result<(), DiagServiceError> {
     for i in 0..bit_len {
-        if bit_pos + i >= data.len() * 8 {
+        if bit_pos.saturating_add(i) >= data.len().saturating_mul(8) {
             // If the bit position exceeds the data length, we stop processing
             break;
         }
 
-        let mask_byte_idx = mask.len() - (i / 8) - 1;
+        let mask_byte_idx = mask.len().saturating_sub(i / 8).saturating_sub(1);
         let mask_bit_pos = i % 8;
         let mask_bit = mask
             .get(mask_byte_idx)
             .map_or(0, |&byte| (byte >> mask_bit_pos) & 1);
 
-        let data_byte_idx = data.len() - ((bit_pos + i) / 8) - 1;
-        let data_bit_pos = (bit_pos + i) % 8;
+        let data_byte_idx = data
+            .len()
+            .saturating_sub(bit_pos.saturating_add(i) / 8)
+            .saturating_sub(1);
+        let data_bit_pos = bit_pos.saturating_add(i) % 8;
         let data_bit = data
             .get(data_byte_idx)
             .map_or(0, |&byte| (byte >> data_bit_pos) & 1);
@@ -735,7 +772,7 @@ fn apply_condensed_mask_unpacking(
 
     let mut extracted_bits_count = 0;
     for i in 0..bit_len {
-        let src_byte_index = bit_field.len() - (i / 8) - 1;
+        let src_byte_index = bit_field.len().saturating_sub(i / 8).saturating_sub(1);
         let src_bit_offset = i % 8;
 
         if src_byte_index < bit_mask.len() {
@@ -747,7 +784,9 @@ fn apply_condensed_mask_unpacking(
                     .get(src_byte_index)
                     .map_or(0, |&byte| (byte >> src_bit_offset) & 1);
 
-                let target_byte_index = result_byte_count - (extracted_bits_count / 8) - 1;
+                let target_byte_index = result_byte_count
+                    .saturating_sub(extracted_bits_count / 8)
+                    .saturating_sub(1);
                 let target_bit_offset = extracted_bits_count % 8;
 
                 set_bit_checked(
@@ -757,7 +796,7 @@ fn apply_condensed_mask_unpacking(
                     bit_value,
                     false,
                 )?;
-                extracted_bits_count += 1;
+                extracted_bits_count = extracted_bits_count.saturating_add(1);
             }
         }
     }
@@ -790,26 +829,32 @@ fn apply_condensed_mask_packing(
     let mut mask_bit_idx = 0;
 
     loop {
-        if mask_bit_idx >= mask.len() * 8 {
+        if mask_bit_idx >= mask.len().saturating_mul(8) {
             break;
         }
 
-        let mask_byte_idx = mask.len() - (mask_bit_idx / 8) - 1;
+        let mask_byte_idx = mask
+            .len()
+            .saturating_sub(mask_bit_idx / 8)
+            .saturating_sub(1);
         let mask_bit_pos = mask_bit_idx % 8;
         let mask_bit = mask
             .get(mask_byte_idx)
             .map_or(0, |&byte| (byte >> mask_bit_pos) & 1);
-        mask_bit_idx += 1;
+        mask_bit_idx = mask_bit_idx.saturating_add(1);
 
-        if mask_bit == 1 && data_bit_idx < data.len() * 8 {
-            let data_byte_idx = data.len() - ((bit_pos + data_bit_idx) / 8) - 1;
-            let data_bit_pos = (bit_pos + data_bit_idx) % 8;
+        if mask_bit == 1 && data_bit_idx < data.len().saturating_mul(8) {
+            let data_byte_idx = data
+                .len()
+                .saturating_sub(bit_pos.saturating_add(data_bit_idx) / 8)
+                .saturating_sub(1);
+            let data_bit_pos = bit_pos.saturating_add(data_bit_idx) % 8;
             let data_bit = data
                 .get(data_byte_idx)
                 .map_or(0, |&byte| (byte >> data_bit_pos) & 1);
 
             set_bit_checked(&mut result, mask_byte_idx, mask_bit_pos, data_bit, true)?;
-            data_bit_idx += 1;
+            data_bit_idx = data_bit_idx.saturating_add(1);
         }
     }
 
@@ -877,6 +922,8 @@ fn pack_data(
         if remainder != 0 {
             let last_byte_idx = bit_length / 8;
             if let Some(last_byte) = result.get_mut(last_byte_idx) {
+                // this can be allowed as this operation here can never underflow.
+                #[allow(clippy::arithmetic_side_effects)]
                 let mask_byte = (1u8 << remainder) - 1;
                 *last_byte &= mask_byte;
             }
@@ -893,9 +940,12 @@ fn pack_data(
         result
             .get_mut(start_idx..)
             .ok_or_else(|| DiagServiceError::BadPayload("Result slice out of bounds".to_owned()))?
-            .copy_from_slice(data.get(data.len() - copy_bytes..).ok_or_else(|| {
-                DiagServiceError::BadPayload("Data slice out of bounds".to_owned())
-            })?);
+            .copy_from_slice(
+                data.get(data.len().saturating_sub(copy_bytes)..)
+                    .ok_or_else(|| {
+                        DiagServiceError::BadPayload("Data slice out of bounds".to_owned())
+                    })?,
+            );
         Ok(())
     }
 
@@ -911,7 +961,7 @@ fn pack_data(
             let mut result = vec![0u8; result_byte_len];
 
             let copy_bytes = data.len().min(result_byte_len);
-            let start_idx = result_byte_len - copy_bytes;
+            let start_idx = result_byte_len.saturating_sub(copy_bytes);
 
             checked_copy_from_data_start_idx_to_slice(data, &mut result, copy_bytes, start_idx)?;
             clear_bits_above_bit_len(bit_len, &mut result);
@@ -925,7 +975,7 @@ fn pack_data(
         let mut result = vec![0u8; result_byte_len];
 
         let copy_bytes = data.len().min(result_byte_len);
-        let start_idx = result_byte_len - copy_bytes;
+        let start_idx = result_byte_len.saturating_sub(copy_bytes);
 
         checked_copy_from_data_start_idx_to_slice(data, &mut result, copy_bytes, start_idx)?;
         clear_bits_above_bit_len(bit_len, &mut result);
@@ -1455,7 +1505,7 @@ mod tests {
 
         let (data, bit_len) = diag_type.decode(payload, byte_pos, 0)?;
         assert_eq!(data, expected);
-        assert_eq!(bit_len, expected.len() * 8);
+        assert_eq!(bit_len, expected.len().saturating_mul(8));
         Ok(())
     }
 
@@ -1617,7 +1667,7 @@ mod tests {
 
         let (data, bit_len) = diag_type.decode(payload, byte_pos, bit_pos)?;
         assert_eq!(data, expected);
-        assert_eq!(bit_len, expected.len() * 8);
+        assert_eq!(bit_len, expected.len().saturating_mul(8));
         Ok(())
     }
 
@@ -1627,8 +1677,8 @@ mod tests {
             8,
             0,
             0,
-            &[0x03, 0xab, 0xcd, 0xef], // First byte (0x03) indicates 3 bytes follow
-            &[0xab, 0xcd, 0xef],       // Expected: 3 bytes after length byte
+            &[0x03, 0xAB, 0xCD, 0xEF], // First byte (0x03) indicates 3 bytes follow
+            &[0xAB, 0xCD, 0xEF],       // Expected: 3 bytes after length byte
         )
         .unwrap();
     }
@@ -1639,8 +1689,8 @@ mod tests {
             16,
             0,
             0,
-            &[0x00, 0x02, 0xcd, 0xef], // First two bytes (0x0002) indicate 2 bytes follow
-            &[0xcd, 0xef],             // Expected: 2 bytes after length bytes
+            &[0x00, 0x02, 0xCD, 0xEF], // First two bytes (0x0002) indicate 2 bytes follow
+            &[0xCD, 0xEF],             // Expected: 2 bytes after length bytes
         )
         .unwrap();
     }
@@ -1651,8 +1701,8 @@ mod tests {
             32,
             0,
             0,
-            &[0x00, 0x00, 0x00, 0x02, 0xcd, 0xef], // First four bytes indicate 2 bytes follow
-            &[0xcd, 0xef],                         // Expected: 2 bytes after length bytes
+            &[0x00, 0x00, 0x00, 0x02, 0xCD, 0xEF], // First four bytes indicate 2 bytes follow
+            &[0xCD, 0xEF],                         // Expected: 2 bytes after length bytes
         )
         .unwrap();
     }
@@ -1663,8 +1713,8 @@ mod tests {
             64,
             0,
             0,
-            &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xcd, 0xef],
-            &[0xcd, 0xef],
+            &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xCD, 0xEF],
+            &[0xCD, 0xEF],
         )
         .unwrap();
     }
@@ -1687,8 +1737,8 @@ mod tests {
             3,
             0,
             0,
-            &[0x03, 0xab, 0xcd, 0xef], // First 3 bits indicate 3 bytes follow
-            &[0xab, 0xcd, 0xef],
+            &[0x03, 0xAB, 0xCD, 0xEF], // First 3 bits indicate 3 bytes follow
+            &[0xAB, 0xCD, 0xEF],
         )
         .unwrap();
     }
@@ -1699,7 +1749,7 @@ mod tests {
                 8,
                 0,
                 0,
-                &[0x03, 0xab], // Indicates 3 bytes but only 1 byte available
+                &[0x03, 0xAB], // Indicates 3 bytes but only 1 byte available
                 &[],
             )
             .is_err()
@@ -1708,7 +1758,7 @@ mod tests {
 
     #[test]
     fn test_leading_length_zero() {
-        test_leading_length(8, 0, 0, &[0x00, 0xff], &[]).unwrap();
+        test_leading_length(8, 0, 0, &[0x00, 0xFF], &[]).unwrap();
     }
 
     #[test]
@@ -1766,7 +1816,7 @@ mod tests {
 
     #[test]
     fn test_encode_leading_length_8bit() {
-        let input = vec![0xab, 0xcd, 0xef];
+        let input = vec![0xAB, 0xCD, 0xEF];
         let mut expected = vec![0x03];
         expected.extend(input.clone());
         test_encode_leading_length(8, &input, &expected).unwrap();
@@ -1774,7 +1824,7 @@ mod tests {
 
     #[test]
     fn test_encode_leading_length_16bit() {
-        let input = vec![0xcd, 0xef];
+        let input = vec![0xCD, 0xEF];
         let mut expected = vec![0x00, 0x02];
         expected.extend(input.clone());
         test_encode_leading_length(16, &input, &expected).unwrap();
@@ -1782,7 +1832,7 @@ mod tests {
 
     #[test]
     fn test_encode_leading_length_32bit() {
-        let input = vec![0xcd, 0xef];
+        let input = vec![0xCD, 0xEF];
         let mut expected = vec![0x00, 0x00, 0x00, 0x02];
         expected.extend(input.clone());
         test_encode_leading_length(32, &input, &expected).unwrap();
@@ -2015,18 +2065,18 @@ mod tests {
 
     #[test]
     fn test_encode_standard_length_float64() {
-        let input = [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf1];
+        let input = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF1];
         let expected = input;
         test_encode_standard_length(64, None, false, &input, &expected, DataType::Float64).unwrap();
     }
 
     #[test]
     fn test_encode_standard_length_uint32() {
-        let input = [0xff, 0xff, 0xff, 0xaa];
+        let input = [0xFF, 0xFF, 0xFF, 0xAA];
         // expect 4 bytes payload, with 0xaa for the last byte
         // since we have to allocate 4 bytes to be able to allocate
         // data at index (byte pos) 3
-        let expected = vec![0x00, 0x00, 0x00, 0xaa];
+        let expected = vec![0x00, 0x00, 0x00, 0xAA];
         test_encode_standard_length_with_byte_pos(
             3,
             8,
@@ -2157,7 +2207,7 @@ mod tests {
     #[test]
     fn test_encode_standard_length_masked_change_unprotected_bits_only() {
         let mut uds_payload = vec![0x00, 0x00];
-        let input = vec![0xff, 0xff];
+        let input = vec![0xFF, 0xFF];
         // Mask: protect only upper nibble
         // will protect 0x0f for both payload bytes.
         let bit_mask = vec![0xF0, 0xF0];
@@ -2252,7 +2302,7 @@ mod tests {
             DataType::Int32,
             DiagCodedTypeVariant::StandardLength(StandardLengthType {
                 bit_length: 4,
-                bit_mask: Some(vec![0b_0000_0111_u8]),
+                bit_mask: Some(vec![0b_0000_0111u8]),
                 condensed: false,
             }),
         )
@@ -2351,40 +2401,40 @@ mod tests {
 
     #[test]
     fn test_decode_leading_length_8bit() {
-        let payload = vec![0x03, 0xab, 0xcd, 0xef];
+        let payload = vec![0x03, 0xAB, 0xCD, 0xEF];
         let diag_type = DiagCodedType::new_high_low_byte_order(
             DataType::ByteField,
             DiagCodedTypeVariant::LeadingLengthInfo(8),
         )
         .unwrap();
         let (data, bit_len) = diag_type.decode(&payload, 0, 0).unwrap();
-        assert_eq!(data, vec![0xab, 0xcd, 0xef]);
+        assert_eq!(data, vec![0xAB, 0xCD, 0xEF]);
         assert_eq!(bit_len, 24);
     }
 
     #[test]
     fn test_decode_leading_length_16bit() {
-        let payload = vec![0x00, 0x02, 0xcd, 0xef];
+        let payload = vec![0x00, 0x02, 0xCD, 0xEF];
         let diag_type = DiagCodedType::new_high_low_byte_order(
             DataType::ByteField,
             DiagCodedTypeVariant::LeadingLengthInfo(16),
         )
         .unwrap();
         let (data, bit_len) = diag_type.decode(&payload, 0, 0).unwrap();
-        assert_eq!(data, vec![0xcd, 0xef]);
+        assert_eq!(data, vec![0xCD, 0xEF]);
         assert_eq!(bit_len, 16);
     }
 
     #[test]
     fn test_decode_leading_length_32bit() {
-        let payload = vec![0x00, 0x00, 0x00, 0x02, 0xcd, 0xef];
+        let payload = vec![0x00, 0x00, 0x00, 0x02, 0xCD, 0xEF];
         let diag_type = DiagCodedType::new_high_low_byte_order(
             DataType::ByteField,
             DiagCodedTypeVariant::LeadingLengthInfo(32),
         )
         .unwrap();
         let (data, bit_len) = diag_type.decode(&payload, 0, 0).unwrap();
-        assert_eq!(data, vec![0xcd, 0xef]);
+        assert_eq!(data, vec![0xCD, 0xEF]);
         assert_eq!(bit_len, 16);
     }
 
@@ -2455,7 +2505,7 @@ mod tests {
     #[test]
     fn test_decode_min_max_length_end_of_pdu_termination() {
         // special case, we have no data at the end of the PDU
-        let payload = vec![0xaa, 0xbb];
+        let payload = vec![0xAA, 0xBB];
         let diag_type = DiagCodedType::new_high_low_byte_order(
             DataType::ByteField,
             DiagCodedTypeVariant::MinMaxLength(MinMaxLengthType {
@@ -2470,7 +2520,7 @@ mod tests {
         assert_eq!(bit_len, 0);
 
         // special case, we have no data at the end of the PDU
-        let payload = vec![0xaa, 0xbb, 0xcc, 0xdd];
+        let payload = vec![0xAA, 0xBB, 0xCC, 0xDD];
         let diag_type = DiagCodedType::new_high_low_byte_order(
             DataType::ByteField,
             DiagCodedTypeVariant::MinMaxLength(MinMaxLengthType {
@@ -2481,7 +2531,7 @@ mod tests {
         )
         .unwrap();
         let (data, bit_len) = diag_type.decode(&payload, 1, 0).unwrap();
-        assert_eq!(data, vec![0xbb, 0xcc, 0xdd]);
+        assert_eq!(data, vec![0xBB, 0xCC, 0xDD]);
         assert_eq!(bit_len, 24);
     }
 
@@ -2580,7 +2630,7 @@ mod tests {
     #[test]
     fn test_decode_error_cases() {
         // Insufficient data for leading length
-        let payload = vec![0x03, 0xab];
+        let payload = vec![0x03, 0xAB];
         let diag_type = DiagCodedType::new_high_low_byte_order(
             DataType::ByteField,
             DiagCodedTypeVariant::LeadingLengthInfo(8),

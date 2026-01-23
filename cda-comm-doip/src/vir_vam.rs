@@ -14,17 +14,16 @@
 use std::{future::Future, sync::Arc, time::Duration};
 
 use cda_interfaces::{
-    DiagServiceError, DoipComParamProvider, EcuAddressProvider, HashMap, HashMapExtensions,
+    DiagServiceError, DoipComParamProvider, EcuAddressProvider, HashMap, HashMapExtensions, dlt_ctx,
 };
 use doip_definitions::{
     header::PayloadType,
     payload::{DoipPayload, VehicleIdentificationRequest},
 };
 use doip_sockets::udp::UdpSocket;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc};
 
 use crate::{DoipDiagGateway, DoipTarget, connections::handle_gateway_connection};
-
 pub(crate) async fn get_vehicle_identification<T, F>(
     socket: &mut UdpSocket,
     netmask: u32,
@@ -88,9 +87,12 @@ where
 
 #[allow(clippy::too_many_lines)] // allowed due to nested functions
 pub(crate) async fn listen_for_vams<T, F>(
+    tester_ip: String,
+    gateway_port: u16,
     netmask: u32,
     gateway: DoipDiagGateway<T>,
     variant_detection: mpsc::Sender<Vec<String>>,
+    send_timeout: Duration,
     shutdown_signal: F,
 ) where
     T: EcuAddressProvider + DoipComParamProvider,
@@ -103,9 +105,14 @@ pub(crate) async fn listen_for_vams<T, F>(
         netmask: u32,
     }
 
-    #[tracing::instrument(skip(gateway, gateway_ecu_map, gateway_ecu_name_map, variant_detection))]
+    #[tracing::instrument(skip(gateway, gateway_ecu_map, gateway_ecu_name_map, variant_detection),
+        fields(
+            dlt_context = dlt_ctx!("DOIP")
+        )
+    )]
     async fn handle_doip_response<T: EcuAddressProvider + DoipComParamProvider>(
         gateway: &DoipDiagGateway<T>,
+        send_timeout: Duration,
         doip_msg_ctx: DoipMessageContext,
         gateway_ecu_map: &HashMap<u16, Vec<u16>>,
         gateway_ecu_name_map: &HashMap<u16, Vec<String>>,
@@ -146,13 +153,19 @@ pub(crate) async fn listen_for_vams<T, F>(
                         &gateway.doip_connections,
                         &gateway.ecus,
                         gateway_ecu_map,
+                        send_timeout,
                     )
                     .await
                     {
                         Ok(logical_address) => {
                             gateway.logical_address_to_connection.write().await.insert(
                                 logical_address,
-                                gateway.doip_connections.read().await.len() - 1,
+                                gateway
+                                    .doip_connections
+                                    .read()
+                                    .await
+                                    .len()
+                                    .saturating_sub(1),
                             );
                             send_variant_detection(
                                 gateway_ecu_name_map,
@@ -175,6 +188,9 @@ pub(crate) async fn listen_for_vams<T, F>(
         }
     }
 
+    #[tracing::instrument(skip_all,
+        fields(dlt_context = dlt_ctx!("DOIP"))
+    )]
     async fn send_variant_detection(
         gateway_ecu_name_map: &HashMap<u16, Vec<String>>,
         variant_detection: &mpsc::Sender<Vec<String>>,
@@ -216,8 +232,28 @@ pub(crate) async fn listen_for_vams<T, F>(
     cda_interfaces::spawn_named!(
         "vam-listen",
         Box::pin(async move {
+            let broadcast_ip = "0.0.0.0";
+            let broadcast_socket = if tester_ip == broadcast_ip {
+                Arc::clone(&gateway.socket)
+            } else {
+                match crate::create_socket(broadcast_ip, gateway_port) {
+                    Ok(sock) => Arc::new(Mutex::new(sock)),
+                    Err(e) => {
+                        tracing::warn!(
+                            broadcast_ip = %broadcast_ip,
+                            tester_ip = %tester_ip,
+                            gateway_port = %gateway_port,
+                            error = ?e,
+                            "Failed to bind broadcast socket, falling back to tester IP,\
+                             this can lead to missed VAMs"
+                        );
+                        Arc::clone(&gateway.socket)
+                    }
+                }
+            };
+
             loop {
-                let mut socket = gateway.socket.lock().await;
+                let mut socket = broadcast_socket.lock().await;
                 let signal = shutdown_signal.clone();
                 tokio::select! {
                     () = signal => {
@@ -226,17 +262,24 @@ pub(crate) async fn listen_for_vams<T, F>(
                     Some(Ok((doip_msg, source_addr))) = socket.recv() => {
                         if let DoipPayload::VehicleAnnouncementMessage(_) = &doip_msg.payload {
                             handle_doip_response(
-                                &gateway, DoipMessageContext { doip_msg, source_addr, netmask },
-                                &gateway_ecu_map, &gateway_ecu_name_map, variant_detection.clone(),
+                                &gateway,
+                                send_timeout,
+                                DoipMessageContext { doip_msg, source_addr, netmask },
+                                &gateway_ecu_map,
+                                &gateway_ecu_name_map,
+                                variant_detection.clone(),
                             ).await;
                         }
-                    }
+                    },
                 }
             }
         })
     );
 }
 
+#[tracing::instrument(skip_all,
+    fields(dlt_context = dlt_ctx!("DOIP"))
+)]
 async fn handle_vam<T>(
     ecus: &Arc<HashMap<String, RwLock<T>>>,
     doip_msg: doip_definitions::message::DoipMessage,

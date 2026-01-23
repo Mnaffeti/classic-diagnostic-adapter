@@ -28,12 +28,16 @@ path = "src/lib.rs"
 # internal dependencies
 cda-interfaces = { workspace = true }
 
+async-trait = { workspace = true }
+
 # tls
 openssl = { workspace = true }
 
 socket2 = { workspace = true, features = ["all"] }
 #tokio
 tokio = { workspace = true, features = ["sync", "fs", "time", "rt", "io-util"] }
+#futures
+futures = { workspace = true }
 
 serde_json = { workspace = true }
 
@@ -44,3 +48,4 @@ strum = { workspace = true }
 [features]
 default = []
 openssl-vendored = ["openssl/vendored"]
+dlt-tracing = ["cda-interfaces/dlt-tracing"]

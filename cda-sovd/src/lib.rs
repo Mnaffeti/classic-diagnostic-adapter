@@ -11,102 +11,156 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use std::sync::Arc;
+use std::{future::Future, sync::Arc};
 
-use aide::{axum::ApiRouter as Router, openapi::OpenApi, swagger::Swagger};
+use aide::{
+    axum::{ApiRouter as Router, routing},
+    openapi::OpenApi,
+    swagger::Swagger,
+};
 use axum::{
-    Extension, Json, ServiceExt,
+    Extension, Json,
     http::{self, Request},
-    middleware, routing,
 };
 use cda_interfaces::{
-    DoipGatewaySetupError, HashMap, SchemaProvider, UdsEcu, diagservices::DiagServiceResponse,
-    file_manager::FileManager,
+    DoipGatewaySetupError, FunctionalDescriptionConfig, HashMap, SchemaProvider, UdsEcu,
+    diagservices::DiagServiceResponse, dlt_ctx, file_manager::FileManager,
 };
 use cda_plugin_security::SecurityPluginLoader;
-use futures::future::FutureExt;
+use dynamic_router::DynamicRouter;
 use tokio::net::TcpListener;
-use tower::Layer;
-use tower_http::trace::TraceLayer;
+use tower::{Layer, ServiceExt as TowerServiceExt};
+use tower_http::{normalize_path::NormalizePathLayer, trace::TraceLayer};
 
+pub use crate::sovd::locks::Locks;
+
+pub mod dynamic_router;
 mod openapi;
 pub(crate) mod sovd;
 
 // Consts for HTTP
 pub const SWAGGER_UI_ROUTE: &str = "/swagger-ui";
 pub const OPENAPI_JSON_ROUTE: &str = "/openapi.json";
-
 #[derive(Clone)]
 pub struct WebServerConfig {
     pub host: String,
     pub port: u16,
 }
 
-/// Launches the http(s) webserver for handling SOVD requests
+/// Launches the http(s) webserver with deferred initialization
+///
+/// The server starts immediately with static endpoints. SOVD routes and other functionality
+/// can be added later by calling methods on the returned `DynamicRouter`.
 ///
 /// # Errors
-/// Will return `Err` in case that the webserver couldn´t be launched.
-/// This can be caused due to invalid config, ports or addresses already
-/// being in use or an error when initializing the `DoIP` gateway.
-// type alias does not allow specifying hasher, we set the hasher globally.
-#[allow(clippy::implicit_hasher)]
+/// Will return `Err` in case that the webserver couldn't be launched.
+/// This can be caused due to invalid config, ports or addresses already being in use.
 #[tracing::instrument(
-    skip(config, ecu_uds, file_manager, shutdown_signal),
+    skip(config, shutdown_signal),
     fields(
         host = %config.host,
         port = %config.port,
+    )
+)]
+pub async fn launch_webserver<F>(
+    config: WebServerConfig,
+    shutdown_signal: F,
+) -> Result<(DynamicRouter, tokio::task::JoinHandle<()>), DoipGatewaySetupError>
+where
+    F: Future<Output = ()> + Clone + Send + 'static,
+{
+    let dynamic_router = DynamicRouter::new();
+    let listen_address = format!("{}:{}", config.host, config.port);
+    let listener = TcpListener::bind(&listen_address).await.map_err(|e| {
+        DoipGatewaySetupError::ServerError(format!("Failed to bind to {listen_address}: {e}"))
+    })?;
+
+    let dynamic_router_for_service = dynamic_router.clone();
+    let webserver_task = cda_interfaces::spawn_named!("webserver", async move {
+        let service = tower::service_fn(move |request: Request<axum::body::Body>| {
+            let dr = dynamic_router_for_service.clone();
+            async move {
+                let router = dr.get_router().await;
+                TowerServiceExt::oneshot(router, request).await
+            }
+        });
+
+        let middleware = tower::util::MapRequestLayer::new(rewrite_request_uri);
+        let trim_trailing_slash_middleware = NormalizePathLayer::trim_trailing_slash();
+        let service_with_middleware =
+            middleware.layer(trim_trailing_slash_middleware.layer(service));
+
+        let _ = axum::serve(listener, tower::make::Shared::new(service_with_middleware))
+            .with_graceful_shutdown(shutdown_signal)
+            .await;
+    });
+
+    Ok((dynamic_router, webserver_task))
+}
+
+/// Add vehicle routes to the dynamic router
+///
+/// This function should be called after the database is loaded to add all vehicle routes
+/// to the webserver.
+///
+/// # Errors
+/// Will return `Err` if routes cannot be added to the dynamic router.
+// type alias does not allow specifying hasher, we set the hasher globally.
+#[allow(clippy::implicit_hasher)]
+#[tracing::instrument(
+    skip(dynamic_router, ecu_uds, file_manager, locks),
+    fields(
         flash_files_path = %flash_files_path
     )
 )]
-pub async fn launch_webserver<F, R, T, M, S>(
-    config: WebServerConfig,
+pub async fn add_vehicle_routes<R, T, M, S>(
+    dynamic_router: &DynamicRouter,
     ecu_uds: T,
     flash_files_path: String,
     file_manager: HashMap<String, M>,
-    shutdown_signal: F,
+    locks: Arc<Locks>,
+    functional_group_config: FunctionalDescriptionConfig,
 ) -> Result<(), DoipGatewaySetupError>
 where
-    F: Future<Output = ()> + Send + 'static,
     R: DiagServiceResponse,
-    T: UdsEcu + SchemaProvider + Clone,
-    M: FileManager,
+    T: UdsEcu + SchemaProvider + Clone + Send + Sync + 'static,
+    M: FileManager + Send + Sync + 'static,
     S: SecurityPluginLoader,
 {
-    let clonable_shutdown_signal = shutdown_signal.shared();
+    let vehicle_router = sovd::route::<R, T, M, S>(
+        functional_group_config,
+        &ecu_uds,
+        flash_files_path,
+        file_manager,
+        locks,
+    )
+    .await;
 
-    let vdetect = ecu_uds.clone();
-    cda_interfaces::spawn_named!("startup-variant-detection", async move {
-        vdetect.start_variant_detection().await;
-    });
+    // Update the router with the new routes,
+    // merge with existing router to preserve existing routes
+    dynamic_router.merge_routes(vehicle_router).await;
 
-    aide::generate::on_error(|e| {
-        if let aide::Error::DuplicateRequestBody = e {
-            // skip DuplicateRequestBody
-            // those are triggered when overwriting the input type
-            return;
-        }
-        tracing::error!(error = %e, "OpenAPI generation error");
-    });
-    aide::generate::extract_schemas(true);
+    tracing::info!("Vehicle routes added to webserver");
+    Ok(())
+}
+
+/// Add `OpenAPI` routes to the dynamic router, call this once all routes
+/// that should be documented are added, this will not update on further route additions and
+/// has to be called again.
+pub async fn add_openapi_routes(
+    dynamic_router: &DynamicRouter,
+    web_server_config: &WebServerConfig,
+) {
+    let server_url = format!(
+        "http://{}:{}",
+        web_server_config.host, web_server_config.port
+    );
     let mut api = OpenApi::default();
-
-    // Main application routes (with NormalizePathLayer)
-    let app_routes = {
-        let app = Router::new()
-            .merge(sovd::route::<R, T, M, S>(&ecu_uds, flash_files_path, file_manager).await)
-            .finish_api_with(&mut api, openapi::api_docs);
-
-        create_trace_layer(app)
-            .layer(tower_http::timeout::TimeoutLayer::new(
-                std::time::Duration::from_secs(30),
-            ))
-            .layer(middleware::from_fn(
-                sovd::error::sovd_method_not_allowed_handler,
-            ))
-            .fallback(sovd::error::sovd_not_found_handler)
-            .route(
+    dynamic_router
+        .update_router(|r| {
+            r.route(
                 SWAGGER_UI_ROUTE,
-                Swagger::new(OPENAPI_JSON_ROUTE).axum_route().into(),
+                Swagger::new(OPENAPI_JSON_ROUTE).axum_route(),
             )
             .route(
                 OPENAPI_JSON_ROUTE,
@@ -114,35 +168,11 @@ where
                     Json((*api).clone())
                 }),
             )
+            .finish_api_with(&mut api, |api| openapi::api_docs(api, server_url))
             .layer(Extension(Arc::new(api)))
-    };
-
-    let middleware = tower::util::MapRequestLayer::new(rewrite_request_uri);
-    let trim_trailing_slash_middleware =
-        tower_http::normalize_path::NormalizePathLayer::trim_trailing_slash().layer(app_routes);
-    let app_with_middleware = middleware.layer(trim_trailing_slash_middleware);
-
-    let listen_address = format!("{}:{}", config.host, config.port);
-    match TcpListener::bind(&listen_address).await {
-        Ok(listener) => {
-            tracing::info!(listen_address = %listen_address, "Server listening");
-            axum::serve(listener, app_with_middleware.into_make_service())
-                .with_graceful_shutdown(clonable_shutdown_signal)
-                .await
-                .map_err(|e| {
-                    DoipGatewaySetupError::ServerError(format!("Axum serve error: {e}"))
-                })?;
-        }
-        Err(e) => {
-            tracing::error!(
-                listen_address = %listen_address,
-                error = %e,
-                "Failed to bind to address"
-            );
-        }
-    }
-
-    Ok(())
+            .into()
+        })
+        .await;
 }
 
 fn rewrite_request_uri<B>(mut req: Request<B>) -> Request<B> {
@@ -167,7 +197,8 @@ fn rewrite_request_uri<B>(mut req: Request<B>) -> Request<B> {
     *req.uri_mut() = new_uri;
     req
 }
-fn create_trace_layer<S>(route: axum::Router<S>) -> axum::Router<S>
+
+fn create_trace_layer<S>(route: Router<S>) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
@@ -181,6 +212,7 @@ where
                         status_code = tracing::field::Empty,
                         latency = tracing::field::Empty,
                         error = tracing::field::Empty,
+                        dlt_context = dlt_ctx!("SOVD"),
                 )
             })
             .on_request(|request: &axum::http::Request<_>, _span: &tracing::Span| {
@@ -216,4 +248,18 @@ where
                 },
             ),
     )
+}
+
+#[cfg(test)]
+pub(crate) mod test_utils {
+    use serde::de::DeserializeOwned;
+
+    pub(crate) async fn axum_response_into<T: DeserializeOwned>(
+        response: axum::response::Response,
+    ) -> Result<T, serde_json::Error> {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice::<T>(body.as_ref())
+    }
 }

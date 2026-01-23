@@ -41,7 +41,7 @@ pub(crate) mod aide_helper {
         ($struct_name:ident $value_name:ident $type:ty) => {
             #[derive(serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
             pub(crate) struct $struct_name {
-                $value_name: $type,
+                pub $value_name: $type,
             }
 
             impl std::ops::Deref for $struct_name {
@@ -74,7 +74,9 @@ pub(crate) mod aide_helper {
     pub(crate) use gen_path_param;
 }
 
-pub(crate) fn api_docs(api: TransformOpenApi) -> TransformOpenApi {
+// Allowing pass by value here for the config, to prevent life-time issues with the
+// borrowed config in the closure.
+pub(crate) fn api_docs(api: TransformOpenApi, server_url: String) -> TransformOpenApi {
     api.title("Eclipse OpenSOVD - Classic Diagnostic Adapter")
         .summary(
             "In the SOVD (Service-Oriented Vehicle Diagnostics) context, a Classic Diagnostic \
@@ -100,7 +102,7 @@ pub(crate) fn api_docs(api: TransformOpenApi) -> TransformOpenApi {
             ..Default::default()
         })
         .server(Server {
-            url: "http://localhost:20002".to_owned(),
+            url: server_url,
             ..Default::default()
         })
 }
@@ -162,7 +164,7 @@ pub(crate) fn ecu_service_response(op: TransformOperation) -> TransformOperation
         res.inner().content.insert(
             "application/octet-stream".to_owned(),
             MediaType {
-                example: Some(serde_json::json!([0xabu8, 0xcd, 0xef, 0x00])),
+                example: Some(serde_json::json!([0xABu8, 0xCD, 0xEF, 0x00])),
                 ..Default::default()
             },
         );

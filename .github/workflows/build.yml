@@ -46,11 +46,16 @@ jobs:
         run: cargo fmt -- --check --config group_imports=StdExternalCrate
       - name: Formatting - check imports granularity
         run: cargo fmt -- --check --config imports_granularity=Crate
+      - name: Formatting - check hex literals
+        run: cargo fmt -- --check --config hex_literal_case=Upper
       - name: run clippy nightly
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
-  codegen:
+  features:
     runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "--cfg tokio_unstable -L /usr/local/lib"
+      PKG_CONFIG_PATH: "/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -59,11 +64,29 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.88.0
+          toolchain: nightly-2025-07-14
+          components: clippy
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
-      - name: Build with codegen
-        run: cargo build --locked --verbose --features gen-flatbuffers,gen-protos
+        with:
+          # The action queries the GitHub API to fetch releases data,
+          # to avoid rate limiting, passing the default token.
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Setup DLT
+        uses: eclipse-opensovd/dlt-tracing-lib/.github/actions/setup-dlt@main
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Build all features
+        run: cargo build --locked --verbose --all-features
+      - name: Build minimal features
+        run: cargo build --locked --verbose --no-default-features
+      - name: Build minimal CDA only
+        # Building CDA only makes sure that optional dependencies
+        # from within the workspace are properly marked as optional and guarded
+        # with cfg flags.
+        run: cargo build --locked --verbose --no-default-features --package opensovd-cda
 
   build_and_test:
     runs-on: ubuntu-latest
@@ -83,7 +106,7 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
       - name: Install cargo-deny
-        run: cargo install --locked --version 0.18.3 cargo-deny
+        run: cargo install --locked --version 0.18.9 cargo-deny
       - name: Install taplo toml toolkit
         run: cargo install --locked --version 0.10.0 taplo-cli
       - name: check fmt

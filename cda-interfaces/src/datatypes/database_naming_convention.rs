@@ -63,7 +63,7 @@ impl DatabaseNamingConvention {
             if self.long_name_affix_position == DiagnosticServiceAffixPosition::Suffix
                 && long_name_lowercase.ends_with(affix)
             {
-                return long_name[..long_name.len() - affix.len()].to_string();
+                return long_name[..long_name.len().saturating_sub(affix.len())].to_string();
             }
         }
         long_name.to_string()
@@ -85,7 +85,7 @@ impl DatabaseNamingConvention {
             if self.short_name_affix_position == DiagnosticServiceAffixPosition::Suffix
                 && short_name_lowercase.ends_with(affix)
             {
-                return short_name[..short_name.len() - affix.len()].to_string();
+                return short_name[..short_name.len().saturating_sub(affix.len())].to_string();
             }
         }
         short_name.to_string()
@@ -111,6 +111,11 @@ impl Default for DatabaseNamingConvention {
                 "_read_dump".to_owned(),
                 "_write_dump".to_owned(),
                 "_dump".to_owned(),
+                "read_func".to_owned(),
+                "write_func".to_owned(),
+                "read_dump_func".to_owned(),
+                "write_dump_func".to_owned(),
+                "dump_func".to_owned(),
             ],
             long_name_affixes: vec![
                 " read".to_owned(),
@@ -118,6 +123,11 @@ impl Default for DatabaseNamingConvention {
                 " read dump".to_owned(),
                 " write dump".to_owned(),
                 " dump".to_owned(),
+                " read func".to_owned(),
+                " write func".to_owned(),
+                " read dump func".to_owned(),
+                " write dump func".to_owned(),
+                " dump func".to_owned(),
             ],
         }
     }

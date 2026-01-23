@@ -15,19 +15,18 @@ use std::{sync::Arc, time::Duration};
 
 use cda_database::datatypes;
 use cda_interfaces::{
-    DiagCommAction, DiagCommType, DiagServiceError, DynamicPlugin, EcuState, EcuVariant, HashMap,
-    HashMapExtensions, HashSet, Protocol, STRINGS, SecurityAccess, ServicePayload, StringId,
+    DiagCommAction, DiagCommType, DiagServiceError, DynamicPlugin, EcuManagerType, EcuState,
+    EcuVariant, HashMap, HashMapExtensions, HashSet, HashSetExtensions, Protocol, STRINGS,
+    SecurityAccess, ServicePayload, StringId,
     datatypes::{
         AddressingMode, ComParams, ComplexComParamValue, ComponentConfigurationsInfo,
-        ComponentDataInfo, DTC_CODE_BIT_LEN, DatabaseNamingConvention, DtcLookup,
-        DtcReadInformationFunction, RetryPolicy, SdSdg, TesterPresentSendType, semantics,
-        single_ecu,
+        ComponentDataInfo, DTC_CODE_BIT_LEN, DatabaseNamingConvention,
+        DiagnosticServiceAffixPosition, DtcLookup, DtcReadInformationFunction, RetryPolicy, SdSdg,
+        TesterPresentSendType, semantics, single_ecu,
     },
     diagservices::{DiagServiceResponse, DiagServiceResponseType, FieldParseError, UdsPayloadData},
-    service_ids,
-    service_ids::NEGATIVE_RESPONSE,
-    spawn_named, util,
-    util::starts_with_ignore_ascii_case,
+    dlt_ctx, service_ids, spawn_named,
+    util::{self, starts_with_ignore_ascii_case},
 };
 use cda_plugin_security::SecurityPlugin;
 use parking_lot::Mutex;
@@ -44,7 +43,7 @@ use crate::{
         into_db_protocol,
         operations::{self, json_value_to_uds_data},
         payload::Payload,
-        variant_detection,
+        variant_detection::{self, VariantDetection},
     },
 };
 
@@ -52,6 +51,7 @@ pub struct EcuManager<S: SecurityPlugin> {
     pub(crate) diag_database: datatypes::DiagnosticDatabase,
     db_cache: DbCache,
     ecu_name: String,
+    description_type: EcuManagerType,
     database_naming_convention: DatabaseNamingConvention,
     tester_address: u16,
     logical_address: u16,
@@ -73,6 +73,10 @@ pub struct EcuManager<S: SecurityPlugin> {
     duplicating_ecu_names: Option<HashSet<String>>,
 
     protocol: Protocol,
+    // functional group: protocol prefixed or postfixed
+    fg_protocol_position: DiagnosticServiceAffixPosition,
+    // functional group: is protocol case sensitive
+    fg_protocol_case_sensitive: bool,
     access_control: Arc<Mutex<SessionControl>>,
 
     tester_present_retry_policy: bool,
@@ -98,12 +102,14 @@ pub struct EcuManager<S: SecurityPlugin> {
     security_plugin_phantom: std::marker::PhantomData<S>,
 }
 
+#[derive(Default)]
 struct SessionControl {
     session: Option<String>,
     security: Option<String>,
-    /// resets session and or security access back to the default
-    /// after a given time
-    access_reset_task: Option<JoinHandle<()>>,
+    /// resets session back to the default after a given time
+    session_reset_task: Option<JoinHandle<()>>,
+    /// resets security access back to the default after a given time
+    security_reset_task: Option<JoinHandle<()>>,
 }
 
 #[derive(Default)]
@@ -143,10 +149,19 @@ impl<S: SecurityPlugin> cda_interfaces::EcuAddressProvider for EcuManager<S> {
     fn ecu_name(&self) -> String {
         self.ecu_name.clone()
     }
+
+    fn logical_address_eq<T: cda_interfaces::EcuAddressProvider>(&self, other: &T) -> bool {
+        self.logical_address == other.logical_address()
+            && self.logical_gateway_address() == other.logical_gateway_address()
+    }
 }
 
 impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
     type Response = DiagServiceResponseStruct;
+
+    fn is_physical_ecu(&self) -> bool {
+        self.description_type == EcuManagerType::Ecu
+    }
 
     fn variant(&self) -> EcuVariant {
         self.variant.clone()
@@ -178,7 +193,10 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
     #[tracing::instrument(
         target = "variant detection check",
         skip(self, service_responses),
-        fields(ecu_name = self.ecu_name),
+        fields(
+            ecu_name = self.ecu_name,
+            dlt_context = dlt_ctx!("CORE"),
+        ),
     )]
     async fn detect_variant<T: DiagServiceResponse + Sized>(
         &mut self,
@@ -274,7 +292,12 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
         &self.variant_detection.diag_service_requests
     }
 
-    #[tracing::instrument(skip(self), fields(ecu_name = self.ecu_name))]
+    #[tracing::instrument(skip(self),
+        fields(
+            ecu_name = self.ecu_name,
+            dlt_context = dlt_ctx!("CORE"),
+        )
+    )]
     fn comparams(&self) -> Result<ComplexComParamValue, DiagServiceError> {
         // ensure base variant is handled first
         // and maybe be overwritten by variant specific comparams
@@ -298,6 +321,11 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
             .collect())
     }
 
+    #[tracing::instrument(skip_all,
+        fields(
+            dlt_context = dlt_ctx!("CORE"),
+        )
+    )]
     async fn sdgs(
         &self,
         service: Option<&cda_interfaces::DiagComm>,
@@ -443,6 +471,7 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
     /// # Errors
     /// Will return `Err` in cases where the payload doesn´t match the expected UDS response, or if
     /// elements of the response cannot be correctly mapped from the raw data.
+    #[allow(clippy::too_many_lines)] // keep this together
     #[tracing::instrument(
         target = "convert_from_uds",
         skip(self, diag_service, payload),
@@ -451,6 +480,7 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
             service = diag_service.name,
             input = util::tracing::print_hex(&payload.data, 10),
             output = tracing::field::Empty,
+            dlt_context = dlt_ctx!("CORE"),
         ),
         err
     )]
@@ -466,11 +496,26 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
             .map(datatypes::DiagComm)
             .ok_or_else(|| DiagServiceError::InvalidDatabase("No DiagComm found".to_owned()))?;
 
+        let sid = match payload.data.as_slice() {
+            [service_ids::NEGATIVE_RESPONSE, sid_nrq, ..] => *sid_nrq,
+            [service_ids::NEGATIVE_RESPONSE] => {
+                return Err(DiagServiceError::BadPayload(
+                    "NRC without accompanying SID_RQ received".to_owned(),
+                ));
+            }
+            [sid, ..] => *sid,
+            [] => {
+                return Err(DiagServiceError::BadPayload(
+                    "Missing service id".to_owned(),
+                ));
+            }
+        };
+
         let mut uds_payload = Payload::new(&payload.data);
-        let sid = uds_payload
-            .first()
-            .ok_or_else(|| DiagServiceError::BadPayload("Missing SID".to_owned()))?;
-        let sid_value = sid.to_string();
+        let response_first_byte = uds_payload.first().ok_or_else(|| {
+            DiagServiceError::BadPayload("Payload too short to read first byte".to_owned())
+        })?;
+        let response_first_byte_value = response_first_byte.to_string();
 
         let responses: Vec<_> = mapped_service
             .pos_responses()
@@ -486,8 +531,10 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
                     params.iter().map(datatypes::Parameter).collect();
                 if params.iter().any(|p| {
                     p.byte_position() == 0
-                        && p.specific_data_as_coded_const()
-                            .is_some_and(|c| c.coded_value().is_some_and(|v| v == sid_value))
+                        && p.specific_data_as_coded_const().is_some_and(|c| {
+                            c.coded_value()
+                                .is_some_and(|v| v == response_first_byte_value)
+                        })
                 }) {
                     Some((r, params))
                 } else {
@@ -502,10 +549,10 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
                     self.lookup_state_transition_by_diagcomm_for_active(&mapped_diag_comm);
 
                 if let Some(new_session) = new_session {
-                    self.set_session(&new_session, Duration::from_secs(u64::MAX))?;
+                    self.set_session(&new_session, None)?;
                 }
                 if let Some(new_security_access) = new_security {
-                    self.set_security_access(&new_security_access, Duration::from_secs(u64::MAX))?;
+                    self.set_security_access(&new_security_access, None)?;
                 }
             }
 
@@ -577,12 +624,12 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
         } else {
             // Returning a response here, because even valid databases may not define a
             // response for a service.
-            tracing::debug!("No matching response found for SID: {sid_value}");
+            tracing::debug!("No matching response found for SID: {sid}");
             Ok(DiagServiceResponseStruct {
                 service: diag_service.clone(),
                 data: payload.data.clone(),
                 mapped_data: None,
-                response_type: if *sid == NEGATIVE_RESPONSE {
+                response_type: if *response_first_byte == service_ids::NEGATIVE_RESPONSE {
                     DiagServiceResponseType::Negative
                 } else {
                     DiagServiceResponseType::Positive
@@ -599,7 +646,8 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
             service = diag_service.name,
             action = diag_service.action().to_string(),
             input = data.as_ref().map_or_else(|| "None".to_owned(), ToString::to_string),
-            output = tracing::field::Empty
+            output = tracing::field::Empty,
+            dlt_context = dlt_ctx!("CORE"),
         ),
         err
     )]
@@ -642,10 +690,10 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
 
         let mut uds: Vec<u8> = Vec::new();
 
-        let mut num_consts = 0;
+        let mut num_consts = 0usize;
         for param in &mapped_params {
             if let Some(coded_const) = param.specific_data_as_coded_const() {
-                num_consts += 1;
+                num_consts = num_consts.saturating_add(1);
                 let diag_type: datatypes::DiagCodedType = coded_const
                     .diag_coded_type()
                     .and_then(|t| {
@@ -664,8 +712,11 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
                             param.short_name().unwrap_or_default()
                         )))?;
 
-                let uds_val =
-                    operations::string_to_vec_u8(diag_type.base_datatype(), coded_const_value)?;
+                let uds_val = json_value_to_uds_data(
+                    &diag_type,
+                    None,
+                    &serde_json::Value::from(coded_const_value),
+                )?;
 
                 diag_type.encode(
                     uds_val,
@@ -682,7 +733,11 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
                     // todo: check if json_values is empty...
                     for param in mapped_params.iter().skip(num_consts) {
                         if uds.len() < param.byte_position() as usize {
-                            uds.extend(vec![0x0; param.byte_position() as usize - uds.len()]);
+                            uds.extend(vec![
+                                0x0;
+                                (param.byte_position() as usize)
+                                    .saturating_sub(uds.len())
+                            ]);
                         }
                         let short_name = param.short_name().ok_or_else(|| {
                             DiagServiceError::InvalidDatabase(format!(
@@ -721,7 +776,13 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
     /// # Errors
     /// Will return `Err` if the job cannot be found in the database
     /// Unlikely other case is that neither a lookup in the current nor the base variant succeeded.
-    #[tracing::instrument(skip(self), fields(ecu_name = self.ecu_name, job_name))]
+    #[tracing::instrument(skip(self),
+        fields(
+            ecu_name = self.ecu_name,
+            dlt_context = dlt_ctx!("CORE"),
+            job_name
+        )
+    )]
     fn lookup_single_ecu_job(&self, job_name: &str) -> Result<single_ecu::Job, DiagServiceError> {
         tracing::debug!("Looking up single ECU job");
 
@@ -850,23 +911,63 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
             .collect()
     }
 
-    fn set_session(&self, session: &str, expiration: Duration) -> Result<(), DiagServiceError> {
+    #[tracing::instrument(skip_all,
+        fields(
+            dlt_context = dlt_ctx!("CORE"),
+        )
+    )]
+    fn set_session(
+        &self,
+        session: &str,
+        expiration: Option<Duration>,
+    ) -> Result<(), DiagServiceError> {
+        tracing::debug!(
+                ecu_name = self.ecu_name,
+                session = %session,
+                expiration = ?expiration,
+                "Setting session"
+        );
+
         self.access_control.lock().session = Some(session.to_owned());
-        self.start_reset_task(expiration)
+        if let Some(expiration) = expiration
+            && expiration > Duration::ZERO
+        {
+            self.start_session_reset_task(expiration)
+        } else {
+            Ok(())
+        }
     }
 
+    #[tracing::instrument(skip_all,
+        fields(
+            dlt_context = dlt_ctx!("CORE"),
+        )
+    )]
     fn set_security_access(
         &self,
         security_access: &str,
-        expiration: Duration,
+        expiration: Option<Duration>,
     ) -> Result<(), DiagServiceError> {
         tracing::debug!(
-        ecu_name = self.ecu_name,
-            security_access = %security_access,
-            "Setting security access"
+                ecu_name = self.ecu_name,
+                security_access = %security_access,
+                expiration = ?expiration,
+                "Setting security access"
         );
+
         self.access_control.lock().security = Some(security_access.to_owned());
-        self.start_reset_task(expiration)
+        if let Some(expiration) = expiration
+            && expiration > Duration::ZERO
+        {
+            self.start_security_reset_task(expiration)
+        } else {
+            tracing::debug!(
+                ecu_name = self.ecu_name,
+                session = %security_access,
+                "Setting security access without expiration"
+            );
+            Ok(())
+        }
     }
 
     fn lookup_session_change(
@@ -985,6 +1086,10 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
             ))
     }
 
+    fn default_session(&self) -> Result<String, DiagServiceError> {
+        self.default_state(semantics::SESSION)
+    }
+
     fn security_access(&self) -> Result<String, DiagServiceError> {
         self.access_control
             .lock()
@@ -993,6 +1098,10 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
             .ok_or(DiagServiceError::InvalidSession(
                 "ECU security is none".to_string(),
             ))
+    }
+
+    fn default_security_access(&self) -> Result<String, DiagServiceError> {
+        self.default_state(semantics::SECURITY)
     }
 
     /// Returns all services in /configuration, i.e. 0x22 and 0x2E
@@ -1094,12 +1203,14 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
 
                 // collect the coded const bytes of the parameter expressing the ID
                 let bytes = sub_function_id.to_be_bytes();
-                let Some(id_param_bytes) = bytes.get((4 - (sub_func_id_bit_len as usize / 8))..)
+                let Some(id_param_bytes) =
+                    bytes.get(4usize.saturating_sub(sub_func_id_bit_len as usize / 8)..)
                 else {
                     return;
                 };
                 // compile the first bytes of the raw uds payload
-                let mut service_abstract_entry = Vec::with_capacity(1 + id_param_bytes.len());
+                let mut service_abstract_entry =
+                    Vec::with_capacity(1usize.saturating_add(id_param_bytes.len()));
                 service_abstract_entry.push(service_id);
                 service_abstract_entry.extend_from_slice(id_param_bytes);
 
@@ -1221,7 +1332,31 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
             .filter_map(|group| {
                 group
                     .diag_layer()
-                    .and_then(|dl| dl.short_name().map(str::to_lowercase))
+                    .and_then(|dl| dl.short_name())
+                    .and_then(|name| {
+                        let protocol_value = self.protocol.value();
+                        let matches = match self.fg_protocol_position {
+                            DiagnosticServiceAffixPosition::Prefix => {
+                                if self.fg_protocol_case_sensitive {
+                                    name.starts_with(protocol_value)
+                                } else {
+                                    util::starts_with_ignore_ascii_case(name, protocol_value)
+                                }
+                            }
+                            DiagnosticServiceAffixPosition::Suffix => {
+                                if self.fg_protocol_case_sensitive {
+                                    name.ends_with(protocol_value)
+                                } else {
+                                    util::ends_with_ignore_ascii_case(name, protocol_value)
+                                }
+                            }
+                        };
+                        if matches {
+                            Some(name.to_lowercase())
+                        } else {
+                            None
+                        }
+                    })
             })
             .collect::<Vec<_>>()
     }
@@ -1237,6 +1372,18 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
     fn mark_as_duplicate(&mut self) {
         self.variant.state = EcuState::Duplicate;
         self.diag_database.unload();
+    }
+
+    fn revision(&self) -> String {
+        // We cannot remove the closure because there is no direct
+        // access to the underlying flatbuf type, as it's not exported from the database
+        // crate.
+        #[allow(clippy::redundant_closure_for_method_calls)]
+        self.diag_database
+            .ecu_data()
+            .ok()
+            .and_then(|s| s.revision())
+            .map_or_else(|| "0.0.0".to_owned(), ToOwned::to_owned)
     }
 }
 
@@ -1345,12 +1492,48 @@ impl<S: SecurityPlugin> EcuManager<S> {
     ///
     /// Will return `Err` if the ECU database cannot be loaded correctly due to different reasons,
     /// like the format being incompatible or required information missing from the database.
-    #[allow(clippy::too_many_lines)] // todo split into smaller functions
+    #[tracing::instrument(skip_all,
+        fields(
+            dlt_context = dlt_ctx!("CORE"),
+        )
+    )]
     pub fn new(
         database: datatypes::DiagnosticDatabase,
         protocol: Protocol,
         com_params: &ComParams,
         database_naming_convention: DatabaseNamingConvention,
+        type_: EcuManagerType,
+        func_description_config: &cda_interfaces::FunctionalDescriptionConfig,
+    ) -> Result<Self, DiagServiceError> {
+        match type_ {
+            EcuManagerType::Ecu => Self::new_ecu_description(
+                database,
+                protocol,
+                com_params,
+                database_naming_convention,
+                type_,
+                func_description_config,
+            ),
+            EcuManagerType::FunctionalDescription => Self::new_functional_description(
+                database,
+                protocol,
+                com_params,
+                database_naming_convention,
+                type_,
+                func_description_config,
+            ),
+        }
+    }
+
+    // allow keeping the function together as it makes sense structurally
+    #[allow(clippy::too_many_lines)]
+    fn new_ecu_description(
+        database: datatypes::DiagnosticDatabase,
+        protocol: Protocol,
+        com_params: &ComParams,
+        database_naming_convention: DatabaseNamingConvention,
+        type_: EcuManagerType,
+        func_description_config: &cda_interfaces::FunctionalDescriptionConfig,
     ) -> Result<Self, DiagServiceError> {
         let variant_detection = variant_detection::prepare_variant_detection(&database)?;
 
@@ -1399,107 +1582,11 @@ impl<S: SecurityPlugin> EcuManager<S> {
             }
         };
 
-        let logical_tester_address =
-            database.find_com_param(&data_protocol, &com_params.doip.logical_tester_address);
-
         let nack_number_of_retries = database
             .find_com_param(&data_protocol, &com_params.doip.nack_number_of_retries)
             .iter()
-            .map(|(k, v)| {
-                let key_result = if let Some(hex_str) = k.strip_prefix("0x") {
-                    u8::from_str_radix(hex_str, 16)
-                } else {
-                    k.parse::<u8>()
-                }
-                .map_err(|_| {
-                    DiagServiceError::ParameterConversionError(format!(
-                        "Invalid string for doip.nack_number_of_retries: {k}"
-                    ))
-                });
-
-                key_result.map(|key| (key, *v))
-            })
+            .map(datatypes::map_nack_number_of_retries)
             .collect::<Result<HashMap<u8, u32>, DiagServiceError>>()?;
-
-        let diagnostic_ack_timeout =
-            database.find_com_param(&data_protocol, &com_params.doip.diagnostic_ack_timeout);
-
-        let retry_period = database.find_com_param(&data_protocol, &com_params.doip.retry_period);
-
-        let routing_activation_timeout =
-            database.find_com_param(&data_protocol, &com_params.doip.routing_activation_timeout);
-
-        let repeat_request_count_transmission = database.find_com_param(
-            &data_protocol,
-            &com_params.doip.repeat_request_count_transmission,
-        );
-
-        let connection_timeout =
-            database.find_com_param(&data_protocol, &com_params.doip.connection_timeout);
-
-        let connection_retry_delay =
-            database.find_com_param(&data_protocol, &com_params.doip.connection_retry_delay);
-
-        let connection_retry_attempts =
-            database.find_com_param(&data_protocol, &com_params.doip.connection_retry_attempts);
-
-        let tester_present_addr_mode =
-            database.find_com_param(&data_protocol, &com_params.uds.tester_present_addr_mode);
-
-        let tester_present_response_expected = database.find_com_param(
-            &data_protocol,
-            &com_params.uds.tester_present_response_expected,
-        );
-
-        let tester_present_send_type =
-            database.find_com_param(&data_protocol, &com_params.uds.tester_present_send_type);
-
-        let tester_present_message =
-            database.find_com_param(&data_protocol, &com_params.uds.tester_present_message);
-
-        let tester_present_exp_pos_resp =
-            database.find_com_param(&data_protocol, &com_params.uds.tester_present_exp_pos_resp);
-
-        let tester_present_exp_neg_resp =
-            database.find_com_param(&data_protocol, &com_params.uds.tester_present_exp_neg_resp);
-
-        let tester_present_retry_policy =
-            database.find_com_param(&data_protocol, &com_params.uds.tester_present_retry_policy);
-
-        let tester_present_time =
-            database.find_com_param(&data_protocol, &com_params.uds.tester_present_time);
-
-        let repeat_req_count_app =
-            database.find_com_param(&data_protocol, &com_params.uds.repeat_req_count_app);
-
-        let rc_21_retry_policy =
-            database.find_com_param(&data_protocol, &com_params.uds.rc_21_retry_policy);
-
-        let rc_21_completion_timeout =
-            database.find_com_param(&data_protocol, &com_params.uds.rc_21_completion_timeout);
-
-        let rc_21_repeat_request_time =
-            database.find_com_param(&data_protocol, &com_params.uds.rc_21_repeat_request_time);
-
-        let rc_78_retry_policy =
-            database.find_com_param(&data_protocol, &com_params.uds.rc_78_retry_policy);
-
-        let rc_78_completion_timeout =
-            database.find_com_param(&data_protocol, &com_params.uds.rc_78_completion_timeout);
-
-        let rc_78_timeout = database.find_com_param(&data_protocol, &com_params.uds.rc_78_timeout);
-
-        let rc_94_retry_policy =
-            database.find_com_param(&data_protocol, &com_params.uds.rc_94_retry_policy);
-
-        let rc_94_completion_timeout =
-            database.find_com_param(&data_protocol, &com_params.uds.rc_94_completion_timeout);
-
-        let rc_94_repeat_request_time =
-            database.find_com_param(&data_protocol, &com_params.uds.rc_94_repeat_request_time);
-
-        let timeout_default =
-            database.find_com_param(&data_protocol, &com_params.uds.timeout_default);
 
         let ecu_name = database
             .ecu_data()?
@@ -1507,23 +1594,32 @@ impl<S: SecurityPlugin> EcuManager<S> {
             .map(ToOwned::to_owned)
             .ok_or_else(|| DiagServiceError::InvalidDatabase("ECU name not found".to_owned()))?;
 
-        let res = Self {
-            diag_database: database,
+        Ok(Self {
             db_cache: DbCache::default(),
             ecu_name,
+            description_type: type_,
             database_naming_convention,
-            tester_address: logical_tester_address,
+            tester_address: database
+                .find_com_param(&data_protocol, &com_params.doip.logical_tester_address),
             logical_address: logical_ecu_address,
             logical_gateway_address,
             logical_functional_address,
             nack_number_of_retries,
-            diagnostic_ack_timeout,
-            retry_period,
-            routing_activation_timeout,
-            repeat_request_count_transmission,
-            connection_timeout,
-            connection_retry_delay,
-            connection_retry_attempts,
+            diagnostic_ack_timeout: database
+                .find_com_param(&data_protocol, &com_params.doip.diagnostic_ack_timeout),
+            retry_period: database.find_com_param(&data_protocol, &com_params.doip.retry_period),
+            routing_activation_timeout: database
+                .find_com_param(&data_protocol, &com_params.doip.routing_activation_timeout),
+            repeat_request_count_transmission: database.find_com_param(
+                &data_protocol,
+                &com_params.doip.repeat_request_count_transmission,
+            ),
+            connection_timeout: database
+                .find_com_param(&data_protocol, &com_params.doip.connection_timeout),
+            connection_retry_delay: database
+                .find_com_param(&data_protocol, &com_params.doip.connection_retry_delay),
+            connection_retry_attempts: database
+                .find_com_param(&data_protocol, &com_params.doip.connection_retry_attempts),
             variant_detection,
             variant_index: None,
             variant: EcuVariant {
@@ -1534,34 +1630,147 @@ impl<S: SecurityPlugin> EcuManager<S> {
             },
             duplicating_ecu_names: None,
             protocol,
-            access_control: Arc::new(Mutex::new(SessionControl {
-                session: None,
-                security: None,
-                access_reset_task: None,
-            })),
-            tester_present_retry_policy: tester_present_retry_policy.into(),
-            tester_present_addr_mode,
-            tester_present_response_expected: tester_present_response_expected.into(),
-            tester_present_send_type,
-            tester_present_message,
-            tester_present_exp_pos_resp,
-            tester_present_exp_neg_resp,
-            tester_present_time,
-            repeat_req_count_app,
-            rc_21_retry_policy,
-            rc_21_completion_timeout,
-            rc_21_repeat_request_time,
-            rc_78_retry_policy,
-            rc_78_completion_timeout,
-            rc_78_timeout,
-            rc_94_retry_policy,
-            rc_94_completion_timeout,
-            rc_94_repeat_request_time,
-            timeout_default,
+            fg_protocol_position: func_description_config.protocol_position.clone(),
+            fg_protocol_case_sensitive: func_description_config.protocol_case_sensitive,
+            access_control: Arc::new(Mutex::new(SessionControl::default())),
+            tester_present_retry_policy: database
+                .find_com_param(&data_protocol, &com_params.uds.tester_present_retry_policy)
+                .into(),
+            tester_present_addr_mode: database
+                .find_com_param(&data_protocol, &com_params.uds.tester_present_addr_mode),
+            tester_present_response_expected: database
+                .find_com_param(
+                    &data_protocol,
+                    &com_params.uds.tester_present_response_expected,
+                )
+                .into(),
+            tester_present_send_type: database
+                .find_com_param(&data_protocol, &com_params.uds.tester_present_send_type),
+            tester_present_message: database
+                .find_com_param(&data_protocol, &com_params.uds.tester_present_message),
+            tester_present_exp_pos_resp: database
+                .find_com_param(&data_protocol, &com_params.uds.tester_present_exp_pos_resp),
+            tester_present_exp_neg_resp: database
+                .find_com_param(&data_protocol, &com_params.uds.tester_present_exp_neg_resp),
+            tester_present_time: database
+                .find_com_param(&data_protocol, &com_params.uds.tester_present_time),
+            repeat_req_count_app: database
+                .find_com_param(&data_protocol, &com_params.uds.repeat_req_count_app),
+            rc_21_retry_policy: database
+                .find_com_param(&data_protocol, &com_params.uds.rc_21_retry_policy),
+            rc_21_completion_timeout: database
+                .find_com_param(&data_protocol, &com_params.uds.rc_21_completion_timeout),
+            rc_21_repeat_request_time: database
+                .find_com_param(&data_protocol, &com_params.uds.rc_21_repeat_request_time),
+            rc_78_retry_policy: database
+                .find_com_param(&data_protocol, &com_params.uds.rc_78_retry_policy),
+            rc_78_completion_timeout: database
+                .find_com_param(&data_protocol, &com_params.uds.rc_78_completion_timeout),
+            rc_78_timeout: database.find_com_param(&data_protocol, &com_params.uds.rc_78_timeout),
+            rc_94_retry_policy: database
+                .find_com_param(&data_protocol, &com_params.uds.rc_94_retry_policy),
+            rc_94_completion_timeout: database
+                .find_com_param(&data_protocol, &com_params.uds.rc_94_completion_timeout),
+            rc_94_repeat_request_time: database
+                .find_com_param(&data_protocol, &com_params.uds.rc_94_repeat_request_time),
+            timeout_default: database
+                .find_com_param(&data_protocol, &com_params.uds.timeout_default),
             security_plugin_phantom: std::marker::PhantomData::<S>,
-        };
+            diag_database: database, // note: initialize this field last as it moves database
+        })
+    }
 
-        Ok(res)
+    fn new_functional_description(
+        database: datatypes::DiagnosticDatabase,
+        protocol: Protocol,
+        com_params: &ComParams,
+        database_naming_convention: DatabaseNamingConvention,
+        type_: EcuManagerType,
+        func_description_config: &cda_interfaces::FunctionalDescriptionConfig,
+    ) -> Result<Self, DiagServiceError> {
+        // Functional group description: use defaults for all com params
+        let logical_ecu_address = com_params.doip.logical_ecu_address.default;
+        let nack_number_of_retries = com_params
+            .doip
+            .nack_number_of_retries
+            .default
+            .iter()
+            .map(datatypes::map_nack_number_of_retries)
+            .collect::<Result<HashMap<u8, u32>, DiagServiceError>>()?;
+
+        let ecu_name = database
+            .ecu_data()?
+            .ecu_name()
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| DiagServiceError::InvalidDatabase("ECU name not found".to_owned()))?;
+
+        Ok(Self {
+            diag_database: database,
+            db_cache: DbCache::default(),
+            ecu_name,
+            description_type: type_,
+            database_naming_convention,
+            tester_address: com_params.doip.logical_tester_address.default,
+            logical_address: logical_ecu_address,
+            logical_gateway_address: com_params.doip.logical_gateway_address.default,
+            logical_functional_address: com_params.doip.logical_functional_address.default,
+            nack_number_of_retries,
+            diagnostic_ack_timeout: com_params.doip.diagnostic_ack_timeout.default,
+            retry_period: com_params.doip.retry_period.default,
+            routing_activation_timeout: com_params.doip.routing_activation_timeout.default,
+            repeat_request_count_transmission: com_params
+                .doip
+                .repeat_request_count_transmission
+                .default,
+            connection_timeout: com_params.doip.connection_timeout.default,
+            connection_retry_delay: com_params.doip.connection_retry_delay.default,
+            connection_retry_attempts: com_params.doip.connection_retry_attempts.default,
+            variant_detection: VariantDetection {
+                diag_service_requests: HashSet::new(),
+            },
+            variant_index: None,
+            variant: EcuVariant {
+                name: None,
+                is_base_variant: false,
+                state: EcuState::NotTested,
+                logical_address: logical_ecu_address,
+            },
+            duplicating_ecu_names: None,
+            protocol,
+            fg_protocol_position: func_description_config.protocol_position.clone(),
+            fg_protocol_case_sensitive: func_description_config.protocol_case_sensitive,
+            access_control: Arc::new(Mutex::new(SessionControl::default())),
+            tester_present_retry_policy: com_params
+                .uds
+                .tester_present_retry_policy
+                .default
+                .clone()
+                .into(),
+            tester_present_addr_mode: com_params.uds.tester_present_addr_mode.default.clone(),
+            tester_present_response_expected: com_params
+                .uds
+                .tester_present_response_expected
+                .default
+                .clone()
+                .into(),
+            tester_present_send_type: com_params.uds.tester_present_send_type.default.clone(),
+            tester_present_message: com_params.uds.tester_present_message.default.clone(),
+            tester_present_exp_pos_resp: com_params.uds.tester_present_exp_pos_resp.default.clone(),
+            tester_present_exp_neg_resp: com_params.uds.tester_present_exp_neg_resp.default.clone(),
+            tester_present_time: com_params.uds.tester_present_time.default,
+            repeat_req_count_app: com_params.uds.repeat_req_count_app.default,
+            rc_21_retry_policy: com_params.uds.rc_21_retry_policy.default.clone(),
+            rc_21_completion_timeout: com_params.uds.rc_21_completion_timeout.default,
+            rc_21_repeat_request_time: com_params.uds.rc_21_repeat_request_time.default,
+            rc_78_retry_policy: com_params.uds.rc_78_retry_policy.default.clone(),
+            rc_78_completion_timeout: com_params.uds.rc_78_completion_timeout.default,
+            rc_78_timeout: com_params.uds.rc_78_timeout.default,
+            rc_94_retry_policy: com_params.uds.rc_94_retry_policy.default.clone(),
+            rc_94_completion_timeout: com_params.uds.rc_94_completion_timeout.default,
+            rc_94_repeat_request_time: com_params.uds.rc_94_repeat_request_time.default,
+            timeout_default: com_params.uds.timeout_default.default,
+            security_plugin_phantom: std::marker::PhantomData::<S>,
+        })
     }
 
     fn variant(&self) -> Option<datatypes::Variant<'_>> {
@@ -1570,6 +1779,11 @@ impl<S: SecurityPlugin> EcuManager<S> {
         Some(variants.get(idx).into())
     }
 
+    #[tracing::instrument(skip_all,
+        fields(
+            dlt_context = dlt_ctx!("CORE"),
+        )
+    )]
     fn get_diag_layer_all_variants(&self) -> Vec<datatypes::DiagLayer<'_>> {
         let ecu_data = match self.diag_database.ecu_data() {
             Ok(d) => d,
@@ -1801,6 +2015,11 @@ impl<S: SecurityPlugin> EcuManager<S> {
             })
     }
 
+    #[tracing::instrument(skip_all,
+        fields(
+            dlt_context = dlt_ctx!("CORE"),
+        )
+    )]
     fn map_param_from_uds(
         &self,
         mapped_service: &datatypes::DiagService,
@@ -2032,12 +2251,18 @@ impl<S: SecurityPlugin> EcuManager<S> {
         let const_value = c.coded_value().ok_or(DiagServiceError::InvalidDatabase(
             "CodedConst has no coded value".to_owned(),
         ))?;
-        let expected = operations::string_to_vec_u8(diag_type.base_datatype(), const_value)?
-            .into_iter()
-            .collect::<Vec<_>>();
-        let expected = expected.get(expected.len() - value.data.len()..).ok_or(
-            DiagServiceError::BadPayload("Expected value slice out of bounds".to_owned()),
-        )?;
+        let expected = operations::json_value_to_uds_data(
+            &diag_type,
+            None,
+            &serde_json::Value::from(const_value),
+        )?
+        .into_iter()
+        .collect::<Vec<_>>();
+        let expected = expected
+            .get(expected.len().saturating_sub(value.data.len())..)
+            .ok_or(DiagServiceError::BadPayload(
+                "Expected value slice out of bounds".to_owned(),
+            ))?;
         if value.data != expected {
             return Err(DiagServiceError::BadPayload(format!(
                 "{}: Expected {:?}, got {:?}",
@@ -2086,7 +2311,7 @@ impl<S: SecurityPlugin> EcuManager<S> {
                     .or(Some(&serde_json::Value::String("0".to_owned())))
                     .map(|selector| -> Result<_, DiagServiceError> {
                         let switch_key_value = json_value_to_uds_data(
-                            switch_key_diag_type.base_datatype(),
+                            &switch_key_diag_type,
                             normal_dop.compu_method().map(Into::into),
                             selector,
                         )?;
@@ -2288,14 +2513,14 @@ impl<S: SecurityPlugin> EcuManager<S> {
             datatypes::DataOperationVariant::Normal(normal_dop) => {
                 let diag_type = normal_dop.diag_coded_type()?;
                 let uds_data = json_value_to_uds_data(
-                    diag_type.base_datatype(),
+                    &diag_type,
                     normal_dop.compu_method().map(Into::into),
                     value,
                 )?;
                 diag_type.encode(
                     uds_data,
                     payload,
-                    parent_byte_pos + param.byte_position() as usize,
+                    parent_byte_pos.saturating_add(param.byte_position() as usize),
                     param.bit_position() as usize,
                 )?;
                 Ok(())
@@ -2339,7 +2564,7 @@ impl<S: SecurityPlugin> EcuManager<S> {
                 for v in value {
                     self.map_struct_to_uds(
                         &structure,
-                        param.byte_position() as usize + parent_byte_pos,
+                        (param.byte_position() as usize).saturating_add(parent_byte_pos),
                         v,
                         payload,
                     )?;
@@ -2348,7 +2573,7 @@ impl<S: SecurityPlugin> EcuManager<S> {
             }
             datatypes::DataOperationVariant::Structure(structure_dop) => self.map_struct_to_uds(
                 &structure_dop,
-                param.byte_position() as usize + parent_byte_pos,
+                (param.byte_position() as usize).saturating_add(parent_byte_pos),
                 value,
                 payload,
             ),
@@ -2412,6 +2637,11 @@ impl<S: SecurityPlugin> EcuManager<S> {
         Ok(())
     }
 
+    #[tracing::instrument(skip_all,
+        fields(
+            dlt_context = dlt_ctx!("CORE"),
+        )
+    )]
     fn map_dop_from_uds(
         &self,
         mapped_service: &datatypes::DiagService,
@@ -2495,6 +2725,11 @@ impl<S: SecurityPlugin> EcuManager<S> {
         Ok(())
     }
 
+    #[tracing::instrument(skip_all,
+        fields(
+            dlt_context = dlt_ctx!("CORE"),
+        )
+    )]
     fn map_dynamic_length_field_from_uds(
         &self,
         mapped_service: &datatypes::DiagService,
@@ -2553,7 +2788,7 @@ impl<S: SecurityPlugin> EcuManager<S> {
 
         let num_items: u32 = num_items_diag_val.try_into()?;
         let num_items_byte_pos = determine_num_items.byte_position() as usize;
-        uds_payload.set_last_read_byte_pos(num_items_byte_pos + num_items_data.len());
+        uds_payload.set_last_read_byte_pos(num_items_byte_pos.saturating_add(num_items_data.len()));
 
         let mut repeated_data = Vec::new();
 
@@ -2561,7 +2796,9 @@ impl<S: SecurityPlugin> EcuManager<S> {
             dynamic_length_field_dop.offset() as usize,
             uds_payload.len(),
         )?;
-        let mut start = uds_payload.last_read_byte_pos() + uds_payload.bytes_to_skip();
+        let mut start = uds_payload
+            .last_read_byte_pos()
+            .saturating_add(uds_payload.bytes_to_skip());
 
         for _ in 0..num_items {
             uds_payload.push_slice(start, uds_payload.len())?;
@@ -2584,10 +2821,14 @@ impl<S: SecurityPlugin> EcuManager<S> {
             }
 
             uds_payload.pop_slice()?;
-            start += uds_payload.last_read_byte_pos() + uds_payload.bytes_to_skip();
+            start = start.saturating_add(
+                uds_payload
+                    .last_read_byte_pos()
+                    .saturating_add(uds_payload.bytes_to_skip()),
+            );
         }
         uds_payload.pop_slice()?;
-        uds_payload.set_last_read_byte_pos(start - 1);
+        uds_payload.set_last_read_byte_pos(start.saturating_sub(1));
         data.insert(
             short_name,
             DiagDataTypeContainer::RepeatingStruct(repeated_data),
@@ -2620,8 +2861,10 @@ impl<S: SecurityPlugin> EcuManager<S> {
         short_name: String,
         static_field_dop: &datatypes::StaticFieldDop,
     ) -> Result<(), DiagServiceError> {
-        let static_field_size =
-            (static_field_dop.item_byte_size() * static_field_dop.fixed_number_of_items()) as usize;
+        let static_field_size = static_field_dop
+            .item_byte_size()
+            .saturating_mul(static_field_dop.fixed_number_of_items())
+            as usize;
 
         if uds_payload.len() < static_field_size {
             return Err(DiagServiceError::BadPayload(format!(
@@ -2635,8 +2878,10 @@ impl<S: SecurityPlugin> EcuManager<S> {
 
         for i in 0..static_field_dop.fixed_number_of_items() {
             let param_byte_pos = param.byte_position();
-            let start = (param_byte_pos + i * static_field_dop.item_byte_size()) as usize;
-            let end = start + static_field_dop.item_byte_size() as usize;
+            let start = param_byte_pos
+                .saturating_add(i.saturating_mul(static_field_dop.item_byte_size()))
+                as usize;
+            let end = start.saturating_add(static_field_dop.item_byte_size() as usize);
             uds_payload.push_slice(start, end)?;
 
             self.map_nested_struct_from_uds(
@@ -2726,6 +2971,11 @@ impl<S: SecurityPlugin> EcuManager<S> {
         Ok(())
     }
 
+    #[tracing::instrument(skip_all,
+        fields(
+            dlt_context = dlt_ctx!("CORE"),
+        )
+    )]
     fn map_end_of_pdu_dop_from_uds(
         &self,
         mapped_service: &datatypes::DiagService,
@@ -2740,7 +2990,9 @@ impl<S: SecurityPlugin> EcuManager<S> {
         let struct_ =
             extract_struct_dop_from_field(end_of_pdu_dop.field().map(datatypes::DopField))?;
         let mut nested_structs = Vec::new();
-        uds_payload.consume();
+        if uds_payload.consume() == 0 {
+            return Ok(());
+        }
         loop {
             uds_payload.push_slice_to_abs_end(uds_payload.last_read_byte_pos())?;
             if !uds_payload.exhausted() {
@@ -2769,10 +3021,15 @@ impl<S: SecurityPlugin> EcuManager<S> {
                     }
                 }
             }
-            uds_payload.consume();
+            let consumed = uds_payload.consume();
             uds_payload.pop_slice()?;
             if uds_payload.exhausted() {
                 break;
+            } else if consumed == 0 {
+                return Err(DiagServiceError::BadPayload(
+                    "EndOfPdu did not consume any bytes, breaking potential infinite loop"
+                        .to_owned(),
+                ));
             }
         }
 
@@ -2976,6 +3233,11 @@ impl<S: SecurityPlugin> EcuManager<S> {
         (new_session, new_security)
     }
 
+    #[tracing::instrument(skip_all,
+        fields(
+            dlt_context = dlt_ctx!("CORE"),
+        )
+    )]
     fn lookup_state_transition_for_active(
         &self,
         semantic: &str,
@@ -3060,20 +3322,35 @@ impl<S: SecurityPlugin> EcuManager<S> {
                 "No start state defined in state chart".to_owned(),
             ))
     }
-    fn start_reset_task(&self, expiration: Duration) -> Result<(), DiagServiceError> {
-        let session_control = Arc::clone(&self.access_control);
 
-        let default_security = self.default_state(semantics::SECURITY)?;
+    fn start_session_reset_task(&self, expiration: Duration) -> Result<(), DiagServiceError> {
+        let session_control = Arc::clone(&self.access_control);
         let default_session = self.default_state(semantics::SESSION)?;
 
-        self.access_control.lock().access_reset_task = Some(spawn_named!(
-            &format!("access-reset-{}", self.ecu_name),
+        self.access_control.lock().session_reset_task = Some(spawn_named!(
+            &format!("session-reset-{}", self.ecu_name),
             async move {
                 tokio::time::sleep(expiration).await;
                 let mut access = session_control.lock();
-                access.security = Some(default_security);
                 access.session = Some(default_session);
-                access.access_reset_task = None;
+                access.session_reset_task = None;
+            }
+        ));
+
+        Ok(())
+    }
+
+    fn start_security_reset_task(&self, expiration: Duration) -> Result<(), DiagServiceError> {
+        let access_control = Arc::clone(&self.access_control);
+        let default_security = self.default_state(semantics::SECURITY)?;
+
+        self.access_control.lock().security_reset_task = Some(spawn_named!(
+            &format!("security-reset-{}", self.ecu_name),
+            async move {
+                tokio::time::sleep(expiration).await;
+                let mut access = access_control.lock();
+                access.security = Some(default_security);
+                access.security_reset_task = None;
             }
         ));
 
@@ -3167,6 +3444,12 @@ impl<S: SecurityPlugin> EcuManager<S> {
     /// Validate security access via plugin
     /// allows passing a `Box::new(())` to skip security checks
     /// this is used internally, when we don't want to have this run the check again
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            dlt_context = dlt_ctx!("CORE"),
+        )
+    )]
     fn check_security_plugin(
         security_plugin: &DynamicPlugin,
         service: &datatypes::DiagService,
@@ -3254,7 +3537,7 @@ mod tests {
     use std::vec;
 
     use cda_database::datatypes::{
-        DataType, Limit, ResponseType,
+        DataType, DiagCodedTypeVariant, Limit, ResponseType,
         database_builder::{
             Addressing, DiagClassType, DiagCommParams, DiagLayerParams, DiagServiceParams, DopType,
             EcuDataBuilder, EcuDataParams, SpecificDOPData, TransmissionMode,
@@ -3356,7 +3639,7 @@ mod tests {
             )
         };
 
-        let sid = 0x2E_u8;
+        let sid = 0x2Eu8;
         let dc_name = "TestDynamicLengthFieldService";
         let diag_comm = db_builder.create_diag_comm(DiagCommParams {
             short_name: dc_name,
@@ -3411,7 +3694,7 @@ mod tests {
         let neg_response = {
             let nack_param = db_builder.create_coded_const_param(
                 "test_service_nack",
-                &NEGATIVE_RESPONSE.to_string(),
+                &service_ids::NEGATIVE_RESPONSE.to_string(),
                 0,
                 0,
                 8,
@@ -3475,6 +3758,14 @@ mod tests {
             Protocol::DoIp,
             &ComParams::default(),
             DatabaseNamingConvention::default(),
+            EcuManagerType::Ecu,
+            &cda_interfaces::FunctionalDescriptionConfig {
+                description_database: "functional_groups".to_owned(),
+                enabled_functional_groups: None,
+                protocol_position:
+                    cda_interfaces::datatypes::DiagnosticServiceAffixPosition::Suffix,
+                protocol_case_sensitive: false,
+            },
         )
         .unwrap();
 
@@ -3594,7 +3885,7 @@ mod tests {
             )
         };
 
-        let sid = 0x2E_u8;
+        let sid = 0x2Eu8;
         let dc_name = "TestStructService";
         let diag_comm = db_builder.create_diag_comm(DiagCommParams {
             short_name: dc_name,
@@ -3667,6 +3958,14 @@ mod tests {
             Protocol::DoIp,
             &ComParams::default(),
             DatabaseNamingConvention::default(),
+            EcuManagerType::Ecu,
+            &cda_interfaces::FunctionalDescriptionConfig {
+                description_database: "functional_groups".to_owned(),
+                enabled_functional_groups: None,
+                protocol_position:
+                    cda_interfaces::datatypes::DiagnosticServiceAffixPosition::Suffix,
+                protocol_case_sensitive: false,
+            },
         )
         .unwrap();
 
@@ -4020,6 +4319,14 @@ mod tests {
             Protocol::DoIp,
             &ComParams::default(),
             DatabaseNamingConvention::default(),
+            EcuManagerType::Ecu,
+            &cda_interfaces::FunctionalDescriptionConfig {
+                description_database: "functional_groups".to_owned(),
+                enabled_functional_groups: None,
+                protocol_position:
+                    cda_interfaces::datatypes::DiagnosticServiceAffixPosition::Suffix,
+                protocol_case_sensitive: false,
+            },
         )
         .unwrap();
 
@@ -4032,11 +4339,18 @@ mod tests {
         (ecu_manager, dc, sid)
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum EndOfPduStructureType {
+        FixedSize,
+        LeadingLengthDop,
+    }
+
     // allowed because creation of test data should kept together
     #[allow(clippy::too_many_lines)]
     fn create_ecu_manager_with_end_pdu_service(
         min_items: u32,
         max_items: Option<u32>,
+        structure_type: EndOfPduStructureType,
     ) -> (
         super::EcuManager<DefaultSecurityPluginData>,
         cda_interfaces::DiagComm,
@@ -4050,63 +4364,105 @@ mod tests {
         let compu_identical =
             db_builder.create_compu_method(datatypes::CompuCategory::Identical, None, None);
 
-        // Create DOPs for structure parameters within the EndOfPdu
-        let item_param1_dop = {
-            let item_param1_dop_specific_data = db_builder
-                .create_normal_specific_dop_data(
-                    Some(compu_identical),
-                    Some(u8_diag_type),
+        // Create the structure that will be repeated in EndOfPdu
+        let item_structure = match structure_type {
+            EndOfPduStructureType::LeadingLengthDop => {
+                // Create structure with leading length DOP
+                // The DiagCodedType with LeadingLengthInfo handles the length prefix automatically
+                let leading_length_diag_type = db_builder.create_diag_coded_type(
                     None,
-                    None,
-                    None,
-                    None,
+                    DataType::ByteField,
+                    true,
+                    DiagCodedTypeVariant::LeadingLengthInfo(8),
+                );
+
+                let data_dop = {
+                    let data_dop_specific_data = db_builder
+                        .create_normal_specific_dop_data(
+                            Some(compu_identical),
+                            Some(leading_length_diag_type),
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
+                        .value_offset();
+                    db_builder.create_dop(
+                        *DopType::REGULAR,
+                        Some("data_dop"),
+                        None,
+                        *SpecificDOPData::NormalDOP,
+                        Some(data_dop_specific_data),
+                    )
+                };
+
+                let data_param = db_builder.create_value_param("data", data_dop, 0, 0);
+
+                // Create structure with just the data parameter
+                db_builder.create_structure(Some(vec![data_param]), None, true)
+            }
+            EndOfPduStructureType::FixedSize => {
+                // Create fixed-size structure (original behavior)
+                let item_param1_dop = {
+                    let item_param1_dop_specific_data = db_builder
+                        .create_normal_specific_dop_data(
+                            Some(compu_identical),
+                            Some(u8_diag_type),
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
+                        .value_offset();
+                    db_builder.create_dop(
+                        *DopType::REGULAR,
+                        Some("item_param1_dop"),
+                        None,
+                        *SpecificDOPData::NormalDOP,
+                        Some(item_param1_dop_specific_data),
+                    )
+                };
+
+                let item_param2_dop = {
+                    let item_param2_dop_specific_data = db_builder
+                        .create_normal_specific_dop_data(
+                            Some(compu_identical),
+                            Some(u16_diag_type),
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
+                        .value_offset();
+                    db_builder.create_dop(
+                        *DopType::REGULAR,
+                        Some("item_param2_dop"),
+                        None,
+                        *SpecificDOPData::NormalDOP,
+                        Some(item_param2_dop_specific_data),
+                    )
+                };
+
+                // Create parameters for the repeating structure
+                let item_param1 =
+                    db_builder.create_value_param("item_param1", item_param1_dop, 0, 0);
+                let item_param2 =
+                    db_builder.create_value_param("item_param2", item_param2_dop, 1, 0);
+
+                // Create the basic structure that will be repeated
+                db_builder.create_structure(
+                    Some(vec![item_param1, item_param2]),
+                    Some(3), // byte_size: 1 byte + 2 bytes = 3 bytes per item
+                    true,
                 )
-                .value_offset();
-            db_builder.create_dop(
-                *DopType::REGULAR,
-                Some("item_param1_dop"),
-                None,
-                *SpecificDOPData::NormalDOP,
-                Some(item_param1_dop_specific_data),
-            )
+            }
         };
-
-        let item_param2_dop = {
-            let item_param2_dop_specific_data = db_builder
-                .create_normal_specific_dop_data(
-                    Some(compu_identical),
-                    Some(u16_diag_type),
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-                .value_offset();
-            db_builder.create_dop(
-                *DopType::REGULAR,
-                Some("item_param2_dop"),
-                None,
-                *SpecificDOPData::NormalDOP,
-                Some(item_param2_dop_specific_data),
-            )
-        };
-
-        // Create parameters for the repeating structure
-        let item_param1 = db_builder.create_value_param("item_param1", item_param1_dop, 0, 0);
-        let item_param2 = db_builder.create_value_param("item_param2", item_param2_dop, 1, 0);
-
-        // Create the basic structure that will be repeated
-        let item_structure = db_builder.create_structure(
-            Some(vec![item_param1, item_param2]),
-            Some(3), // byte_size: 1 byte + 2 bytes = 3 bytes per item
-            true,
-        );
 
         // Create EndOfPdu DOP using the new helper method
         let end_pdu_dop =
             db_builder.create_end_of_pdu_field_dop(min_items, max_items, Some(item_structure));
 
-        let sid = 0x22_u8;
+        let sid = 0x22u8;
         let dc_name = "TestEndOfPduService";
         let diag_comm = db_builder.create_diag_comm(DiagCommParams {
             short_name: dc_name,
@@ -4196,6 +4552,14 @@ mod tests {
             Protocol::DoIp,
             &ComParams::default(),
             DatabaseNamingConvention::default(),
+            EcuManagerType::Ecu,
+            &cda_interfaces::FunctionalDescriptionConfig {
+                description_database: "functional_groups".to_owned(),
+                enabled_functional_groups: None,
+                protocol_position:
+                    cda_interfaces::datatypes::DiagnosticServiceAffixPosition::Suffix,
+                protocol_case_sensitive: false,
+            },
         )
         .unwrap();
 
@@ -4227,7 +4591,7 @@ mod tests {
         let dtc_dop =
             db_builder.create_dtc_dop(u32_diag_type, Some(vec![dtc]), Some(compu_identical));
 
-        let sid = 0x19_u8;
+        let sid = 0x19u8;
         let dc_name = "TestDtcService";
         let diag_comm = db_builder.create_diag_comm(DiagCommParams {
             short_name: dc_name,
@@ -4317,6 +4681,14 @@ mod tests {
             Protocol::DoIp,
             &ComParams::default(),
             DatabaseNamingConvention::default(),
+            EcuManagerType::Ecu,
+            &cda_interfaces::FunctionalDescriptionConfig {
+                description_database: "functional_groups".to_owned(),
+                enabled_functional_groups: None,
+                protocol_position:
+                    cda_interfaces::datatypes::DiagnosticServiceAffixPosition::Suffix,
+                protocol_case_sensitive: false,
+            },
         )
         .unwrap();
 
@@ -4340,7 +4712,7 @@ mod tests {
             db_builder.create_compu_method(datatypes::CompuCategory::Identical, None, None);
 
         // Create a variant detection service
-        let vd_service_sid = 0x22_u8;
+        let vd_service_sid = 0x22u8;
         let vd_service_name = "ReadVariantData";
 
         // Create DOP for variant code response parameter
@@ -4546,6 +4918,14 @@ mod tests {
             Protocol::DoIp,
             &ComParams::default(),
             DatabaseNamingConvention::default(),
+            EcuManagerType::Ecu,
+            &cda_interfaces::FunctionalDescriptionConfig {
+                description_database: "functional_groups".to_owned(),
+                enabled_functional_groups: None,
+                protocol_position:
+                    cda_interfaces::datatypes::DiagnosticServiceAffixPosition::Suffix,
+                protocol_case_sensitive: false,
+            },
         )
         .unwrap()
     }
@@ -4570,10 +4950,10 @@ mod tests {
                     // Service ID
                     sid,
                     // This does not belong to our mux, it's here to test, if the start byte is used
-                    0xff,
+                    0xFF,
                     // Mux param starts here
                     // there is no switch value for 0xffff
-                    0xff, 0xff,
+                    0xFF, 0xFF,
                 ]),
                 true,
             )
@@ -4591,10 +4971,10 @@ mod tests {
                     // Service ID
                     sid,
                     // This does not belong to our mux, it's here to test, if the start byte is used
-                    0xff,
+                    0xFF,
                     // Mux param starts here
                     // there is no switch value for 0xffff, but we have a default case
-                    0xff, 0xff, //
+                    0xFF, 0xFF, //
                     // value for param 1 of default structure
                     0x42,
                 ]),
@@ -4627,9 +5007,9 @@ mod tests {
                     // Service ID
                     sid,
                     // This does not belong to our mux, it's here to test, if the start byte is used
-                    0xff, // Mux param starts here
+                    0xFF, // Mux param starts here
                     // + switch key byte 0
-                    0x0, 0x0a, // valid switch key but no data, expect error from decode.
+                    0x0, 0x0A, // valid switch key but no data, expect error from decode.
                 ]),
                 true,
             )
@@ -4647,9 +5027,9 @@ mod tests {
                     // Service ID
                     sid,
                     // This does not belong to our mux, it's here to test, if the start byte is used
-                    0xff, // Mux param starts here
+                    0xFF, // Mux param starts here
                     // + switch key byte 0
-                    0x00, 0x0a, // valid switch key but no data, expect error from decode.
+                    0x00, 0x0A, // valid switch key but no data, expect error from decode.
                 ]),
                 true,
             )
@@ -4875,7 +5255,7 @@ mod tests {
         // and subtract one for the gap
         assert_eq!(
             service_payload.data.len(),
-            (struct_byte_pos + struct_byte_len) as usize
+            struct_byte_pos.saturating_add(struct_byte_len) as usize
         );
 
         // Check sid
@@ -4891,7 +5271,7 @@ mod tests {
         assert_eq!(payload.get(1).copied(), Some(0x34));
 
         // Check param2
-        let float_bytes = 42.42_f32.to_be_bytes();
+        let float_bytes = 42.42f32.to_be_bytes();
         assert_eq!(payload.get(2..6), Some(&float_bytes[..]));
 
         // Check param3
@@ -4963,6 +5343,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_convert_to_uds_value_exceeds_bit_len() {
+        let struct_byte_pos = 1;
+        let (ecu_manager, service, _sid, _struct_byte_len) =
+            create_ecu_manager_with_struct_service(struct_byte_pos);
+
+        // Test data for the structure
+        let test_value = json!({
+            "param1": 0x0012_3456,  // exceeds 16 bits
+            "param2": 42.42,
+            "param3": "test"
+        });
+
+        let payload_data = UdsPayloadData::ParameterMap(
+            [("main_param".to_string(), test_value)]
+                .into_iter()
+                .collect(),
+        );
+
+        let result = ecu_manager
+            .create_uds_payload(&service, &skip_sec_plugin!(), Some(payload_data))
+            .await;
+
+        let conversion_error = result.unwrap_err();
+        assert!(
+            conversion_error
+                .to_string()
+                .contains("1193046 exceeds maximum 65535 for bit length 16")
+        );
+    }
+
+    #[tokio::test]
     async fn test_map_mux_to_uds_with_default_case() {
         async fn test_default(
             ecu_manager: &super::EcuManager<DefaultSecurityPluginData>,
@@ -5015,7 +5426,7 @@ mod tests {
             },
         });
 
-        test_default(&ecu_manager, &service, with_selector, 0xffff, sid).await;
+        test_default(&ecu_manager, &service, with_selector, 0xFFFF, sid).await;
         // when not selector value is given,
         // the switch key will use the limit value of the default value
         test_default(&ecu_manager, &service, without_selector, 0, sid).await;
@@ -5078,7 +5489,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_map_struct_from_uds_end_pdu_min_items_not_reached() {
-        let (ecu_manager, service, sid) = create_ecu_manager_with_end_pdu_service(3, Some(2));
+        let (ecu_manager, service, sid) =
+            create_ecu_manager_with_end_pdu_service(3, Some(2), EndOfPduStructureType::FixedSize);
         // Each item is 3 bytes: 1 byte for param1 + 2 bytes for param2
         let data = vec![
             sid, // Service ID
@@ -5114,7 +5526,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_map_struct_from_uds_end_pdu_exact_max_items() {
-        let (ecu_manager, service, sid) = create_ecu_manager_with_end_pdu_service(1, Some(2));
+        let (ecu_manager, service, sid) =
+            create_ecu_manager_with_end_pdu_service(1, Some(2), EndOfPduStructureType::FixedSize);
 
         // Create payload with exactly 2 items (the max_items limit)
         // Each item is 3 bytes: 1 byte for param1 + 2 bytes for param2
@@ -5152,7 +5565,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_map_struct_from_uds_end_pdu_exceeds_max_items() {
-        let (ecu_manager, service, sid) = create_ecu_manager_with_end_pdu_service(1, Some(2));
+        let (ecu_manager, service, sid) =
+            create_ecu_manager_with_end_pdu_service(1, Some(2), EndOfPduStructureType::FixedSize);
 
         // Create payload with 3 items (exceeds max_items = 2)
         let data = vec![
@@ -5187,7 +5601,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_map_struct_from_uds_end_pdu_no_max_no_min_no_data() {
-        let (ecu_manager, service, sid) = create_ecu_manager_with_end_pdu_service(0, None);
+        let (ecu_manager, service, sid) =
+            create_ecu_manager_with_end_pdu_service(0, None, EndOfPduStructureType::FixedSize);
 
         // Valid payload, as min_items = 0 and no max_items
         // Only the SID is present, no items follow
@@ -5210,7 +5625,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_map_struct_from_uds_end_pdu_no_maximum() {
-        let (ecu_manager, service, sid) = create_ecu_manager_with_end_pdu_service(1, None);
+        let (ecu_manager, service, sid) =
+            create_ecu_manager_with_end_pdu_service(1, None, EndOfPduStructureType::FixedSize);
 
         // Create payload with 3 items (exceeds max_items = 2)
         let data = vec![
@@ -5238,6 +5654,83 @@ mod tests {
                  {
                     "item_param1": 0xAA,
                     "item_param2": 0x9ABC
+                }
+            ],
+            "test_service_pos_sid": sid
+        });
+
+        assert_eq!(response.serialize_to_json().unwrap().data, expected_json);
+    }
+
+    #[tokio::test]
+    async fn test_map_struct_from_uds_end_pdu_incomplete_second_structure() {
+        // First structure is 8 bytes long, then next structure is indicated
+        // to be 42 bytes long but there is not enough data
+        let (ecu_manager, service, sid) = create_ecu_manager_with_end_pdu_service(
+            0,
+            None,
+            EndOfPduStructureType::LeadingLengthDop,
+        );
+
+        let mut data = vec![sid]; // Service ID
+
+        // First complete structure: 1 byte length + 8 bytes data = 9 bytes total
+        data.push(8); // Length byte indicating 8 bytes of data
+        data.extend(vec![0xAA; 8]); // 8 bytes of data
+
+        // Second incomplete structure: 1 byte length + insufficient data
+        data.push(42); // Length byte indicating 42 bytes of data
+        data.extend(vec![0xBB; 10]); // Only 10 bytes of data (should be 42)
+
+        let response_json_data = ecu_manager
+            .convert_from_uds(&service, &create_payload(data), true)
+            .await
+            .unwrap()
+            .serialize_to_json()
+            .unwrap()
+            .data;
+
+        let expected_json = json!({
+            "end_pdu_param": [
+                {
+                    "data": "0xAA 0xAA 0xAA 0xAA 0xAA 0xAA 0xAA 0xAA",
+                },
+            ],
+            "test_service_pos_sid": sid
+        });
+
+        assert_eq!(response_json_data, expected_json);
+    }
+
+    #[tokio::test]
+    async fn test_map_struct_from_uds_end_pdu_zero_length_second_structure() {
+        // First structure is 8 bytes long, then next structure is indicated
+        // to be 0 bytes long
+        let (ecu_manager, service, sid) = create_ecu_manager_with_end_pdu_service(
+            0,
+            None,
+            EndOfPduStructureType::LeadingLengthDop,
+        );
+
+        let mut data = vec![sid]; // Service ID
+
+        // First complete structure: 1 byte length + 8 bytes data = 33 bytes total
+        data.push(8); // Length byte indicating 32 bytes of data
+        data.extend(vec![0xAA; 8]); // 8 bytes of data
+
+        // Second structure with zero length: 1 byte length + 0 bytes data = 1 byte total
+        data.push(0); // Length byte indicating 0 bytes of data
+        data.push(42); // Garbage byte that should not be read as part of the structure
+
+        let response = ecu_manager
+            .convert_from_uds(&service, &create_payload(data), true)
+            .await
+            .unwrap();
+
+        let expected_json = json!({
+            "end_pdu_param": [
+                {
+                    "data": "0xAA 0xAA 0xAA 0xAA 0xAA 0xAA 0xAA 0xAA",
                 }
             ],
             "test_service_pos_sid": sid
@@ -5322,7 +5815,7 @@ mod tests {
     #[tokio::test]
     async fn test_negative_response() {
         let (ecu_manager, service, sid) = create_ecu_manager_with_dynamic_length_field_service();
-        let payload = vec![0x7f, sid];
+        let payload = vec![0x7F, sid];
 
         let response = ecu_manager
             .convert_from_uds(&service, &create_payload(payload), true)
@@ -5333,8 +5826,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_negative_response_with_invalid_data_where_no_neg_response_is_defined() {
-        let (ecu_manager, service, sid) = create_ecu_manager_with_end_pdu_service(1, None);
-        let data = vec![0x7f, sid, 0x33];
+        let (ecu_manager, service, sid) =
+            create_ecu_manager_with_end_pdu_service(1, None, EndOfPduStructureType::FixedSize);
+        let data = vec![0x7F, sid, 0x33];
 
         let response = ecu_manager
             .convert_from_uds(&service, &create_payload(data), true)
@@ -5478,5 +5972,245 @@ mod tests {
         let mut ecu_manager = create_ecu_manager_variant_detection();
         ecu_manager.variant.state = EcuState::Offline;
         detect_variant(0, true, "BaseVariant".to_owned(), EcuState::Online, None).await;
+    }
+
+    #[tokio::test]
+    async fn test_set_session_with_no_expiration() {
+        let ecu_manager = create_ecu_manager_variant_detection();
+
+        // Set session without expiration
+        let result = ecu_manager.set_session("DefaultSession", None);
+        assert!(result.is_ok());
+
+        // Verify session was set
+        let session = ecu_manager.session().unwrap();
+        assert_eq!(session, "DefaultSession");
+
+        // Verify no reset task was created
+        assert!(
+            ecu_manager
+                .access_control
+                .lock()
+                .session_reset_task
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_session_with_zero_expiration() {
+        let ecu_manager = create_ecu_manager_variant_detection();
+
+        // Set session with zero expiration
+        let result = ecu_manager.set_session("DefaultSession", Some(Duration::ZERO));
+        assert!(result.is_ok());
+
+        // Verify session was set
+        let session = ecu_manager.session().unwrap();
+        assert_eq!(session, "DefaultSession");
+
+        // Verify no reset task was created for zero duration
+        assert!(
+            ecu_manager
+                .access_control
+                .lock()
+                .session_reset_task
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_session_with_expiration() {
+        let ecu_manager = create_ecu_manager_variant_detection();
+
+        // Set session with expiration
+        let expiration = Duration::from_millis(100);
+        let result = ecu_manager.set_session("Test", Some(expiration));
+        assert!(result.is_ok());
+
+        // Verify session was set
+        let session = ecu_manager.session().unwrap();
+        assert_eq!(session, "Test");
+
+        // Verify reset task was created
+        assert!(
+            ecu_manager
+                .access_control
+                .lock()
+                .session_reset_task
+                .is_some()
+        );
+
+        // Wait for expiration and a bit more
+        tokio::time::sleep(expiration + Duration::from_millis(50)).await;
+
+        // Verify session was reset to default
+        let session_after = ecu_manager.session().unwrap();
+        assert_eq!(session_after, "DefaultSession");
+
+        // Verify reset task is cleared
+        assert!(
+            ecu_manager
+                .access_control
+                .lock()
+                .session_reset_task
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_security_access_with_no_expiration() {
+        let ecu_manager = create_ecu_manager_variant_detection();
+
+        // Set security access without expiration
+        let result = ecu_manager.set_security_access("Locked", None);
+        assert!(result.is_ok());
+
+        // Verify security access was set
+        let security = ecu_manager.security_access().unwrap();
+        assert_eq!(security, "Locked");
+
+        // Verify no reset task was created
+        assert!(
+            ecu_manager
+                .access_control
+                .lock()
+                .security_reset_task
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_security_access_with_zero_expiration() {
+        let ecu_manager = create_ecu_manager_variant_detection();
+
+        // Set security access with zero expiration
+        let result = ecu_manager.set_security_access("Locked", Some(Duration::ZERO));
+        assert!(result.is_ok());
+
+        // Verify security access was set
+        let security = ecu_manager.security_access().unwrap();
+        assert_eq!(security, "Locked");
+
+        // Verify no reset task was created for zero duration
+        assert!(
+            ecu_manager
+                .access_control
+                .lock()
+                .security_reset_task
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_security_access_with_expiration() {
+        let ecu_manager = create_ecu_manager_variant_detection();
+
+        // Set security access with expiration
+        let expiration = Duration::from_millis(100);
+        let result = ecu_manager.set_security_access("Test", Some(expiration));
+        assert!(result.is_ok());
+
+        // Verify security access was set
+        let security = ecu_manager.security_access().unwrap();
+        assert_eq!(security, "Test");
+
+        // Verify reset task was created
+        assert!(
+            ecu_manager
+                .access_control
+                .lock()
+                .security_reset_task
+                .is_some()
+        );
+
+        // Wait for expiration and a bit more
+        tokio::time::sleep(expiration + Duration::from_millis(50)).await;
+
+        // Verify security access was reset to default
+        let security_after = ecu_manager.security_access().unwrap();
+        assert_eq!(security_after, "Locked");
+
+        // Verify reset task is cleared
+        assert!(
+            ecu_manager
+                .access_control
+                .lock()
+                .security_reset_task
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_session_reset_replaces_previous_task() {
+        let ecu_manager = create_ecu_manager_variant_detection();
+
+        // Set session with long expiration
+        ecu_manager
+            .set_session("DefaultSession", Some(Duration::from_secs(10)))
+            .unwrap();
+
+        // Verify task exists
+        assert!(
+            ecu_manager
+                .access_control
+                .lock()
+                .session_reset_task
+                .is_some()
+        );
+
+        // Set session again with short expiration (should replace the task)
+        let short_expiration = Duration::from_millis(100);
+        ecu_manager
+            .set_session("DefaultSession", Some(short_expiration))
+            .unwrap();
+
+        // Wait for the short expiration
+        tokio::time::sleep(short_expiration + Duration::from_millis(50)).await;
+
+        // Session should be reset and task should be cleared
+        assert!(
+            ecu_manager
+                .access_control
+                .lock()
+                .session_reset_task
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_security_reset_replaces_previous_task() {
+        let ecu_manager = create_ecu_manager_variant_detection();
+
+        // Set security with long expiration
+        ecu_manager
+            .set_security_access("Locked", Some(Duration::from_secs(10)))
+            .unwrap();
+
+        // Verify task exists
+        assert!(
+            ecu_manager
+                .access_control
+                .lock()
+                .security_reset_task
+                .is_some()
+        );
+
+        // Set security again with short expiration (should replace the task)
+        let short_expiration = Duration::from_millis(100);
+        ecu_manager
+            .set_security_access("Locked", Some(short_expiration))
+            .unwrap();
+
+        // Wait for the short expiration
+        tokio::time::sleep(short_expiration + Duration::from_millis(50)).await;
+
+        // Security should be reset and task should be cleared
+        assert!(
+            ecu_manager
+                .access_control
+                .lock()
+                .security_reset_task
+                .is_none()
+        );
     }
 }

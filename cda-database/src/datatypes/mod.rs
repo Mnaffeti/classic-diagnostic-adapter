@@ -16,6 +16,7 @@ use std::fmt::Debug;
 use cda_interfaces::{
     DiagServiceError,
     datatypes::{ComParamConfig, ComParamValue, DeserializableCompParam, FlatbBufConfig},
+    dlt_ctx,
 };
 pub use comparam::*;
 pub use data_operation::*;
@@ -535,14 +536,28 @@ impl DiagnosticDatabase {
     /// # Errors
     /// `DiagServiceError::InvalidDatabase` if ECU data is not loaded
     pub fn diag_layers(&self) -> Result<Vec<datatypes::DiagLayer<'_>>, DiagServiceError> {
-        Ok(self
-            .ecu_data()?
-            .variants()
-            .into_iter()
-            .flat_map(|vars| vars.iter())
-            .filter_map(|variant| variant.diag_layer())
-            .map(datatypes::DiagLayer)
-            .collect::<Vec<_>>())
+        let ecu_data = self.ecu_data()?;
+        if let Some(variants) = ecu_data.variants()
+            && !variants.is_empty()
+        {
+            Ok(variants
+                .iter()
+                .filter_map(|variant| variant.diag_layer())
+                .map(datatypes::DiagLayer)
+                .collect::<Vec<_>>())
+        } else if let Some(functional_groups) = ecu_data.functional_groups()
+            && !functional_groups.is_empty()
+        {
+            Ok(functional_groups
+                .iter()
+                .filter_map(|fg| fg.diag_layer())
+                .map(datatypes::DiagLayer)
+                .collect::<Vec<_>>())
+        } else {
+            Err(DiagServiceError::InvalidDatabase(
+                "No variants or functional groups found in ECU data.".to_owned(),
+            ))
+        }
     }
 
     /// Get the base variant from the ECU data
@@ -563,7 +578,8 @@ impl DiagnosticDatabase {
         skip(self),
         fields(
             protocol = ?protocol,
-            param_name = %com_param.name
+            param_name = %com_param.name,
+            dlt_context = dlt_ctx!("DB"),
         )
     )]
     pub fn find_com_param<T: DeserializableCompParam + Serialize + Debug + Clone>(

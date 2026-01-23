@@ -16,6 +16,7 @@ use std::{io::Read, time::Instant};
 use cda_interfaces::{
     HashMap,
     datatypes::FlatbBufConfig,
+    dlt_ctx,
     file_manager::{Chunk, ChunkMetaData, ChunkType, MddError},
 };
 use flatbuffers::VerifierOptions;
@@ -35,6 +36,7 @@ const FILE_MAGIC_BYTES_LEN: usize = FILE_MAGIC_HEX_STR.len() / 2;
 // Allowed because constant functions cannot functions like .get() are not allowed in const fn.
 // However, as we would call panic! on a failure anyway it does not make a difference here.
 #[allow(clippy::indexing_slicing)]
+#[allow(clippy::arithmetic_side_effects)]
 const fn file_magic_bytes() -> [u8; FILE_MAGIC_BYTES_LEN] {
     let string_bytes = FILE_MAGIC_HEX_STR.as_bytes();
     let mut bytes = [0u8; FILE_MAGIC_BYTES_LEN];
@@ -81,7 +83,11 @@ impl From<&ChunkType> for ChunkDataType {
 /// or parsed correctly.
 #[tracing::instrument(
     skip(chunk),
-    fields(mdd_file, chunk_name = %chunk.meta_data.name)
+    fields(
+        mdd_file,
+        chunk_name = %chunk.meta_data.name,
+        dlt_context = dlt_ctx!("DB"),
+    )
 )]
 pub fn load_chunk<'a>(chunk: &'a mut Chunk, mdd_file: &str) -> Result<&'a Vec<u8>, MddError> {
     if chunk.payload.is_none() {

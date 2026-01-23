@@ -233,7 +233,7 @@ pub(crate) mod session {
                 &ecu_name,
                 &request_body.value,
                 &(security_plugin as DynamicPlugin),
-                Duration::from_secs(request_body.mode_expiration.unwrap_or(u64::MAX)),
+                request_body.mode_expiration.map(Duration::from_secs),
             )
             .await
         {
@@ -367,7 +367,7 @@ pub(crate) mod security {
             if parts.len() > 2 {
                 let last_part = parts.last().map(|s| (*s).to_string());
                 let remaining = parts
-                    .get(..parts.len() - 1)
+                    .get(..parts.len().saturating_sub(1))
                     .map_or_else(|| input.to_string(), |slice| slice.join("_"));
                 (remaining, last_part)
             } else {
@@ -439,7 +439,7 @@ pub(crate) mod security {
                 request_seed_service.as_ref(),
                 payload,
                 &(security_plugin as DynamicPlugin),
-                Duration::from_secs(request_body.mode_expiration.unwrap_or(u64::MAX)),
+                request_body.mode_expiration.map(Duration::from_secs),
             )
             .await
         {
