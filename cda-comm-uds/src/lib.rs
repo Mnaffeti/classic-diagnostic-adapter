@@ -1147,7 +1147,13 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
         ecu_name: &str,
         service: Option<&DiagComm>,
     ) -> Result<Vec<cda_interfaces::datatypes::SdSdg>, DiagServiceError> {
-        self.ecu_manager(ecu_name)?.read().await.sdgs(service).await
+        match self.ecu_manager(ecu_name)?.read().await.sdgs(service).await {
+            Err(e @ DiagServiceError::InvalidDatabase(_)) => {
+                tracing::warn!("Unable to fetch Sdgs for {ecu_name}: {e}");
+                Ok(Vec::new())
+            }
+            result => result,
+        }
     }
 
     async fn get_comparams(
